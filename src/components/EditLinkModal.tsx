@@ -1,6 +1,6 @@
-import React, { useState, useMemo, useEffect } from 'react';
+import React, { useState, useMemo, useEffect, useRef } from 'react';
 import { OtzariaLink } from '../types';
-import { X, Check, Trash2, ArrowLeftRight, Search, CheckCircle2, Layers, BookOpen, Bookmark, Filter } from 'lucide-react';
+import { X, Check, Trash2, ArrowLeftRight, Search, CheckCircle2, Layers, BookOpen, Bookmark, Filter, ChevronDown } from 'lucide-react';
 import { parseDocumentSegments, areHeadersMatching } from '../utils/parserAlgorithm';
 
 interface EditLinkModalProps {
@@ -45,6 +45,9 @@ export const EditLinkModal: React.FC<EditLinkModalProps> = ({
   );
   const [searchQuery, setSearchQuery] = useState('');
   const [expandedLines, setExpandedLines] = useState<Record<string, boolean>>({});
+  /** The commentary line is shown on a single line — the modal is for picking a target, not for reading it. */
+  const [isCommExpanded, setIsCommExpanded] = useState(false);
+  const listRef = useRef<HTMLDivElement>(null);
 
   // 1. Find segment for current commentary line
   const commSeg = useMemo(() => {
@@ -150,94 +153,57 @@ export const EditLinkModal: React.FC<EditLinkModalProps> = ({
       });
   }, [currentTabLines, selectedSegIndex, currentTabSegments, searchQuery]);
 
+  // Bring the selected line into view instead of making the user hunt for it down the list.
+  // `nearest` keeps a card that is already visible exactly where it is, so plain clicking
+  // inside the list never jumps the scroll position.
+  useEffect(() => {
+    const card = listRef.current?.querySelector<HTMLElement>(`[data-line-card="${activeTab}-${targetLine}"]`);
+    card?.scrollIntoView({ block: 'nearest' });
+  }, [activeTab, selectedSegIndex, targetLine, filteredLines.length]);
+
   const getTabTitle = (tab: 'primary' | 'rashi' | 'tosafot') => {
     if (tab === 'primary') return targetBookName || 'גמרא / מקור ראשי';
     if (tab === 'rashi') return 'רש"י';
     return 'תוספות';
   };
 
-  const isCurrentTabRashiOrTosafot = activeTab === 'rashi' || activeTab === 'tosafot';
-
   return (
     <div className="fixed inset-0 z-50 bg-black/50 backdrop-blur-xs flex items-center justify-center p-3 md:p-4">
       <div className="bg-[var(--color-surface)] text-[var(--color-on-surface)] rounded-2xl border border-[var(--color-outline-variant)] shadow-2xl max-w-3xl w-full max-h-[90vh] flex flex-col overflow-hidden text-right" dir="rtl">
-        {/* Header */}
-        <div className="p-4 bg-[var(--color-surface-container-high)] border-b border-[var(--color-outline)] flex items-center justify-between shrink-0">
-          <div className="flex items-center gap-2 text-[var(--color-on-surface)] font-bold text-sm md:text-base">
-            <ArrowLeftRight className="w-5 h-5 text-[var(--color-primary)]" />
-            <span>עריכת קישור שורת פירוש #{commLineIndex}</span>
+        {/* Pinned head: title, the commentary line, the tabs and the filters. Everything here
+            stays put so the list of lines below is reachable without scrolling to it. */}
+        <div className="shrink-0 bg-[var(--color-surface-container-high)] border-b border-[var(--color-outline)] px-4 pt-3 pb-3 space-y-2.5">
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2 text-[var(--color-on-surface)] font-bold text-sm md:text-base min-w-0">
+              <ArrowLeftRight className="w-5 h-5 text-[var(--color-primary)] shrink-0" />
+              <span className="truncate">עריכת קישור שורת פירוש #{commLineIndex}</span>
+            </div>
+            <button
+              onClick={onClose}
+              className="p-1.5 text-[var(--color-on-surface-variant)] hover:bg-[var(--color-secondary-subtle)] rounded-xl transition-colors cursor-pointer shrink-0"
+            >
+              <X className="w-5 h-5" />
+            </button>
           </div>
-          <button
-            onClick={onClose}
-            className="p-1.5 text-[var(--color-on-surface-variant)] hover:bg-[var(--color-secondary-subtle)] rounded-xl transition-colors cursor-pointer"
-          >
-            <X className="w-5 h-5" />
-          </button>
-        </div>
 
-        {/* Scrollable Content Body */}
-        <div className="p-4 md:p-5 space-y-4 overflow-y-auto flex-1 bg-[var(--color-surface-container-high)]">
-          {/* Commentary Line Text Box */}
-          <div className="bg-[var(--color-surface)] p-3.5 md:p-4 rounded-xl border border-[var(--color-outline-variant)] shadow-2xs space-y-1">
-            <span className="block text-xs font-bold text-[var(--color-on-surface-variant)]">טקסט הפירוש (שורה {commLineIndex}):</span>
-            <p className="text-sm font-sans leading-relaxed text-[var(--color-on-surface)] font-medium">
+          {/* Commentary line — a single line by default, click to read it in full */}
+          <button
+            type="button"
+            onClick={() => setIsCommExpanded(v => !v)}
+            title={isCommExpanded ? 'צמצם לשורה אחת' : commLineText}
+            className="w-full flex items-start gap-2 text-right bg-[var(--color-surface)] px-3 py-2 rounded-xl border border-[var(--color-outline-variant)] hover:border-[var(--color-primary)] transition-colors cursor-pointer"
+          >
+            <span className="shrink-0 text-[10px] font-mono font-bold text-[var(--color-primary)] bg-[var(--color-primary-subtle)] px-1.5 py-0.5 rounded-md mt-px">
+              שורה {commLineIndex}
+            </span>
+            <p className={`flex-1 min-w-0 text-xs md:text-sm font-sans leading-relaxed text-[var(--color-on-surface)] font-medium ${isCommExpanded ? 'max-h-24 overflow-y-auto' : 'truncate'}`}>
               {commLineText}
             </p>
-          </div>
-
-          {/* Section Header Filter Banner */}
-          {commSeg && (
-            <div className="p-3.5 rounded-xl bg-[var(--color-surface)] border border-[var(--color-outline)] shadow-2xs flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3 text-xs">
-              <div className="flex items-center gap-2 font-bold text-[var(--color-on-surface)]">
-                <Bookmark className="w-4 h-4 text-[var(--color-primary)] shrink-0" />
-                <span>כותרת בקטע הפירוש:</span>
-                <span className="font-serif text-sm font-bold text-[var(--color-primary)] bg-[var(--color-primary-subtle)] px-2.5 py-0.5 rounded-lg border border-[var(--color-primary)]/20">
-                  {commSeg.headerTitle}
-                </span>
-              </div>
-
-              {currentTabSegments.length > 0 ? (
-                <div className="flex items-center gap-1.5 bg-[var(--color-surface-container-high)] px-3 py-1.5 rounded-xl border border-[var(--color-outline)] shrink-0">
-                  <Filter className="w-3.5 h-3.5 text-[var(--color-primary)] shrink-0" />
-                  <span className="font-bold text-[var(--color-on-surface-variant)] text-[11px] shrink-0">סינון כותרת:</span>
-                  <select
-                    value={selectedSegIndex}
-                    onChange={(e) => setSelectedSegIndex(e.target.value === 'all' ? 'all' : Number(e.target.value))}
-                    className="bg-transparent font-bold text-[var(--color-on-surface)] text-xs focus:outline-none cursor-pointer max-w-[220px] truncate"
-                  >
-                    {matchingSegIndex !== -1 && (
-                      <option value={matchingSegIndex}>
-                        ✨ כותרת מקבילה: {currentTabSegments[matchingSegIndex].headerTitle} ({currentTabSegments[matchingSegIndex].endLine - currentTabSegments[matchingSegIndex].startLine + 1} שורות)
-                      </option>
-                    )}
-                    <option value="all">כל שורות הספר ({currentTabLines.length})</option>
-                    {currentTabSegments.map((seg, idx) => {
-                      if (idx === matchingSegIndex) return null;
-                      return (
-                        <option key={idx} value={idx}>
-                          {seg.headerTitle} ({seg.endLine - seg.startLine + 1} שורות)
-                        </option>
-                      );
-                    })}
-                  </select>
-                </div>
-              ) : (
-                <span className="text-[11px] text-[var(--color-on-surface-variant)] italic">
-                  מוצגות כל שורות הספר
-                </span>
-              )}
-            </div>
-          )}
+            <ChevronDown className={`w-4 h-4 shrink-0 text-[var(--color-on-surface-variant)] transition-transform ${isCommExpanded ? 'rotate-180' : ''}`} />
+          </button>
 
           {/* Source Tabs Header */}
-          <div className="space-y-3">
-            <div className="flex items-center justify-between">
-              <span className="text-xs font-bold text-[var(--color-on-surface)]">בחר מקור ושורה לקישור:</span>
-              <span className="text-xs text-[var(--color-primary)] font-semibold">
-                נבחר: {getTabTitle(secondary === 'none' ? 'primary' : secondary)} - שורה {targetLine}
-              </span>
-            </div>
-
+          <div className="space-y-2.5">
             {/* Tabs Bar */}
             <div className="flex items-center gap-1.5 bg-[var(--color-surface)] p-1.5 rounded-xl border border-[var(--color-outline)]">
               {/* Primary Tab */}
@@ -309,9 +275,9 @@ export const EditLinkModal: React.FC<EditLinkModalProps> = ({
               )}
             </div>
 
-            {/* Filter Search Bar & Manual Line Number Input */}
-            <div className="flex items-center gap-2">
-              <div className="relative flex-1">
+            {/* Filter Search Bar, Section Filter & Manual Line Number Input */}
+            <div className="flex flex-wrap items-center gap-2">
+              <div className="relative flex-1 min-w-[180px]">
                 <Search className="w-4 h-4 absolute right-3 top-1/2 -translate-y-1/2 text-[var(--color-on-surface-variant)]" />
                 <input
                   type="text"
@@ -321,6 +287,33 @@ export const EditLinkModal: React.FC<EditLinkModalProps> = ({
                   className="w-full pr-9 pl-3 py-2 text-xs md:text-sm bg-[var(--color-surface)] border border-[var(--color-outline)] rounded-xl text-[var(--color-on-surface)] focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]"
                 />
               </div>
+
+              {currentTabSegments.length > 0 && (
+                <div className="flex items-center gap-1.5 shrink-0 bg-[var(--color-surface)] px-2.5 py-1.5 rounded-xl border border-[var(--color-outline)]">
+                  <Filter className="w-3.5 h-3.5 text-[var(--color-primary)] shrink-0" />
+                  <select
+                    value={selectedSegIndex}
+                    onChange={(e) => setSelectedSegIndex(e.target.value === 'all' ? 'all' : Number(e.target.value))}
+                    className="bg-transparent font-bold text-[var(--color-on-surface)] text-xs focus:outline-none cursor-pointer max-w-[200px] truncate"
+                    title="סינון לפי כותרת"
+                  >
+                    {matchingSegIndex !== -1 && (
+                      <option value={matchingSegIndex}>
+                        ✨ כותרת מקבילה: {currentTabSegments[matchingSegIndex].headerTitle} ({currentTabSegments[matchingSegIndex].endLine - currentTabSegments[matchingSegIndex].startLine + 1} שורות)
+                      </option>
+                    )}
+                    <option value="all">כל שורות הספר ({currentTabLines.length})</option>
+                    {currentTabSegments.map((seg, idx) => {
+                      if (idx === matchingSegIndex) return null;
+                      return (
+                        <option key={idx} value={idx}>
+                          {seg.headerTitle} ({seg.endLine - seg.startLine + 1} שורות)
+                        </option>
+                      );
+                    })}
+                  </select>
+                </div>
+              )}
 
               <div className="flex items-center gap-1 shrink-0 bg-[var(--color-surface)] px-2.5 py-1.5 rounded-xl border border-[var(--color-outline)]">
                 <span className="text-xs font-bold text-[var(--color-on-surface-variant)]">שורה:</span>
@@ -333,11 +326,26 @@ export const EditLinkModal: React.FC<EditLinkModalProps> = ({
                   className="w-14 text-xs font-bold text-center bg-transparent border-none focus:outline-none text-[var(--color-primary)]"
                 />
               </div>
-            </div>
 
-            {/* Lines Grid / Cards List */}
-            <div className="max-h-[340px] overflow-y-auto space-y-2.5 p-1 rounded-xl">
-              {filteredLines.length === 0 ? (
+              {commSeg && (
+                <span
+                  className="flex items-center gap-1 text-[11px] font-bold text-[var(--color-on-surface-variant)] shrink-0"
+                  title={`כותרת הקטע שבו נמצאת שורת הפירוש: ${commSeg.headerTitle}`}
+                >
+                  <Bookmark className="w-3.5 h-3.5 text-[var(--color-primary)] shrink-0" />
+                  <span className="font-serif text-[var(--color-primary)] max-w-[160px] truncate">{commSeg.headerTitle}</span>
+                </span>
+              )}
+            </div>
+          </div>
+        </div>
+
+        {/* Lines Grid / Cards List — the only scrolling area */}
+        <div
+          ref={listRef}
+          className="flex-1 min-h-0 overflow-y-auto space-y-2 p-4 bg-[var(--color-surface-container-high)]"
+        >
+          {filteredLines.length === 0 ? (
                 <div className="p-8 text-center text-xs md:text-sm text-[var(--color-on-surface-variant)] bg-[var(--color-surface)] rounded-xl border border-dashed border-[var(--color-outline)] font-medium space-y-2">
                   <p>לא נמצאו שורות מתאימות ב-{getTabTitle(activeTab)} בכותרת שנבחרה.</p>
                   {selectedSegIndex !== 'all' && (
@@ -368,8 +376,9 @@ export const EditLinkModal: React.FC<EditLinkModalProps> = ({
                   return (
                     <div
                       key={lineKey}
+                      data-line-card={lineKey}
                       onClick={() => handleSelectLine(lineIdx1, activeTab)}
-                      className={`p-3.5 rounded-xl border transition-all cursor-pointer space-y-1.5 text-right relative ${activeCardStyle}`}
+                      className={`p-3 rounded-xl border transition-all cursor-pointer space-y-1 text-right relative ${activeCardStyle}`}
                     >
                       {/* Top line card info */}
                       <div className="flex items-center justify-between text-xs font-bold">
@@ -395,13 +404,13 @@ export const EditLinkModal: React.FC<EditLinkModalProps> = ({
                         <div className="space-y-1">
                           <p
                             className={`text-xs md:text-sm font-sans leading-relaxed text-[var(--color-on-surface)] ${
-                              isCurrentTabRashiOrTosafot && !isExpanded ? 'line-clamp-3' : ''
+                              !isExpanded ? 'line-clamp-3' : ''
                             }`}
                           >
                             {text}
                           </p>
 
-                          {isCurrentTabRashiOrTosafot && text.length > 180 && (
+                          {text.length > 180 && (
                             <button
                               type="button"
                               onClick={(e) => toggleExpand(lineKey, e)}
@@ -420,12 +429,10 @@ export const EditLinkModal: React.FC<EditLinkModalProps> = ({
                   );
                 })
               )}
-            </div>
-          </div>
         </div>
 
         {/* Footer Actions */}
-        <div className="p-4 bg-[var(--color-surface-container-high)] border-t border-[var(--color-outline)] flex items-center justify-between shrink-0">
+        <div className="p-4 bg-[var(--color-surface-container-high)] border-t border-[var(--color-outline)] flex flex-wrap items-center justify-between gap-2 shrink-0">
           <button
             type="button"
             onClick={handleDelete}
@@ -436,6 +443,9 @@ export const EditLinkModal: React.FC<EditLinkModalProps> = ({
           </button>
 
           <div className="flex items-center gap-2">
+            <span className="text-xs text-[var(--color-primary)] font-semibold px-1">
+              נבחר: {getTabTitle(secondary === 'none' ? 'primary' : secondary)} · שורה {targetLine}
+            </span>
             <button
               type="button"
               onClick={onClose}

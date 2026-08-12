@@ -517,7 +517,7 @@ const TOSAFOT_PREFIX_ALTS = toPrefixAlternation(TOSAFOT_KEYWORDS);
 const NOT_HEBREW_LETTER_AHEAD = '(?![\\u05D0-\\u05EA])';
 
 const SECONDARY_PREFIX_STRIP_RE = new RegExp(
-  `^(?:${RASHI_PREFIX_ALTS}|${TOSAFOT_PREFIX_ALTS}|שם\\s+ד"ה|או"ד|באו"ד|א"ד|בא"ד|אד|באד|אוד|באוד|בד"ה|בדה)${NOT_HEBREW_LETTER_AHEAD}\\s*[:.\\-]?\\s*`,
+  `^(?:${RASHI_PREFIX_ALTS}|${TOSAFOT_PREFIX_ALTS}|שם\\s+ד"ה|או"ד|באו"ד|א"ד|בא"ד|אד|באד|אוד|באוד|בד"ה|בדה)\\s*[:.\\-]?\\s*`,
   'i'
 );
 
@@ -599,7 +599,7 @@ function startsWithSourceKeyword(line: string, keywords: string[]): boolean {
 // The trailing "no Hebrew letter ahead" is the same whole-word requirement the source-name lists
 // carry (see startsWithSourceKeyword): without it "משנהו של מלך" is stripped down to "ו של מלך",
 // exactly as "בתולה" was cut to "לה" by the Tosafot name.
-const SOURCE_CONTEXT_STRIP_RE = /^(?:בגמרא|גמרא|בגמ'|גמ'|בפיסקא|פיסקא|במשנה|משנה|מתניתין|מתניתן|מתני')(?![א-ת])\s*[:.\-]?\s*/i;
+const SOURCE_CONTEXT_STRIP_RE = /^(?:בגמרא|גמרא|בגמ'|גמ'|בפיסקא|פיסקא|במשנה|משנה|מתניתין|מתניתן|מתני')\s*[:.\-]?\s*/i;
 
 /** Leading numbering / bullet / bracketed note, e.g. "3." "(א)" "[הגהה]" "•". */
 const LEADING_BULLET_STRIP_RE = /^(?:\d+[\.\)]|[ א-ת][\.\)]|\([^)]+\)|\[[^\]]+\]|[•\-\*])\s*/;
@@ -730,8 +730,8 @@ export function isBareSourceLabelLine(line: string): boolean {
     .trim();
   const lineForKeywordCheck = stripLeadingMarkers(cleanedPrefix) || cleanedPrefix || normalized;
 
-  const namesSecondary = startsWithSourceKeyword(lineForKeywordCheck, RASHI_KEYWORDS_NORM)
-    || startsWithSourceKeyword(lineForKeywordCheck, TOSAFOT_KEYWORDS_NORM);
+  const namesSecondary = RASHI_KEYWORDS_NORM.some(kw => lineForKeywordCheck.startsWith(kw))
+    || TOSAFOT_KEYWORDS_NORM.some(kw => lineForKeywordCheck.startsWith(kw));
 
   return namesSecondary && !stripSecondaryPrefix(line.trim()).trim();
 }
@@ -1970,11 +1970,11 @@ export function runLinkingParser(
       let targetSecondary: 'rashi' | 'tosafot' | null = null;
       let explicitSecondaryTarget = false;
 
-      if (startsWithSourceKeyword(lineForKeywordCheck, RASHI_KEYWORDS_NORM)) {
+      if (RASHI_KEYWORDS_NORM.some(kw => lineForKeywordCheck.startsWith(kw))) {
         targetSecondary = 'rashi';
         explicitSecondaryTarget = true;
         if (DEBUG) console.log(`  ✅ Detected Rashi keyword. normalizedPrefixLine='${normalizedPrefixLine}'`);
-      } else if (startsWithSourceKeyword(lineForKeywordCheck, TOSAFOT_KEYWORDS_NORM)) {
+      } else if (TOSAFOT_KEYWORDS_NORM.some(kw => lineForKeywordCheck.startsWith(kw))) {
         targetSecondary = 'tosafot';
         explicitSecondaryTarget = true;
         if (DEBUG) console.log(`  ✅ Detected Tosafot keyword. normalizedPrefixLine='${normalizedPrefixLine}'`);
@@ -2009,7 +2009,7 @@ export function runLinkingParser(
       if (!targetSecondary) {
         // Same whole-word requirement as the secondary lists above — "משנהו"/"גמרתי" must not
         // register as an explicit primary citation and pull in the flexibility ladder.
-        if (startsWithSourceKeyword(cleanedPrefix, GEMARA_KEYWORDS_NORM) || startsWithSourceKeyword(cleanedPrefix, MISHNA_KEYWORDS_NORM)) {
+        if (GEMARA_KEYWORDS_NORM.some(kw => cleanedPrefix.startsWith(kw)) || MISHNA_KEYWORDS_NORM.some(kw => cleanedPrefix.startsWith(kw))) {
           explicitPrimaryTarget = true;
           if (DEBUG) console.log(`  ✅ Detected explicit primary-source keyword (Gemara/Mishna). cleanedPrefix='${cleanedPrefix}'`);
         }

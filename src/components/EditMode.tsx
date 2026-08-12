@@ -1,6 +1,6 @@
-import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } from 'react';
 import { SessionState, OtzariaLink } from '../types';
-import { formatLineWithDH, parseDocumentSegments } from '../utils/parserAlgorithm';
+import { formatLineWithDH, parseDocumentSegments, findLinkingStartLine } from '../utils/parserAlgorithm';
 import { EditLinkModal } from './EditLinkModal';
 import {
   Edit3,
@@ -64,7 +64,13 @@ const getTargetColors = (target?: 'rashi' | 'tosafot' | 'primary' | string) => {
 };
 
 
-const CollapsibleText = ({ text, isPrimary, links, targetType }: { text: string; isPrimary: boolean; links?: OtzariaLink[]; targetType?: 'rashi' | 'tosafot' | 'primary' | string }) => {
+/**
+ * Memoised: the body splits the source line into words and rebuilds the highlight map for
+ * every link on it, and there is one of these per group. Opening a drag re-renders
+ * EditMode without touching any of these props, and paying for the whole list again is
+ * what made the drag overlay appear late.
+ */
+const CollapsibleText = React.memo(({ text, isPrimary, links, targetType }: { text: string; isPrimary: boolean; links?: OtzariaLink[]; targetType?: 'rashi' | 'tosafot' | 'primary' | string }) => {
   const [isExpanded, setIsExpanded] = useState(isPrimary);
 
   // Parse words and determine highlights if links are provided
@@ -202,7 +208,8 @@ const CollapsibleText = ({ text, isPrimary, links, targetType }: { text: string;
       </button>
     </div>
   );
-};
+});
+CollapsibleText.displayName = 'CollapsibleText';
 
 
 const CollapsibleCommentary = ({ html }: { html: string }) => {
@@ -251,13 +258,24 @@ export const EditMode: React.FC<EditModeProps> = ({
   const [sourceSearchQuery, setSourceSearchQuery] = useState('');
   const [drawerTab, setDrawerTab] = useState<'nav' | 'search'>('nav');
 
+  // Scroll-to-row request from the unlinked panel, served after the next render.
+  const [pendingScrollLineIdx, setPendingScrollLineIdx] = useState<number | null>(null);
+  const highlightTimerRef = useRef<number | undefined>(undefined);
+
   // Connection Lines State
   const containerRef = useRef<HTMLDivElement>(null);
+  /** Read by `updateSvgLines`, which runs from a ResizeObserver and cannot read state. */
+  const isDragSessionOpenRef = useRef(false);
   const [svgLines, setSvgLines] = useState<{ id: string; x1: number; y1: number; x2: number; y2: number; color?: string }[]>([]);
 
   const updateSvgLines = useCallback(() => {
     if (!containerRef.current) return;
-    
+
+    // A drag hides the whole list behind the scrim, so the connector lines cannot be seen
+    // — and recomputing them means a `getBoundingClientRect` per highlighted word plus a
+    // re-render, landing on the very frame that has to put the overlay on screen.
+    if (isDragSessionOpenRef.current) return;
+
     // Hide visual connection lines on mobile screens where columns stack vertically
     if (window.innerWidth < 768) {
       setSvgLines([]);
@@ -480,6 +498,21 @@ export const EditMode: React.FC<EditModeProps> = ({
   }, [links]);
 
   /**
+   * First commentary line the parser links from — everything above it is front matter that
+   * precedes the first header with a counterpart in the source (הקדמה, הסכמות, שער וכו').
+   * The parser never searches those lines, so the editor must not present them as lines that
+   * failed to find a source: they are shown plainly, with no warning and no unlinked count.
+   */
+  const linkingStartLine = useMemo(
+    () => findLinkingStartLine(commentaryLines, sourceLines, rashiLines, tosafotLines),
+    [commentaryLines, sourceLines, rashiLines, tosafotLines]
+  );
+  const isFrontMatterLine = useCallback(
+    (lineIdx1: number) => lineIdx1 < linkingStartLine,
+    [linkingStartLine]
+  );
+
+  /**
    * For a בא"ד line that found no source: the unlinked line above whose context it will
    * inherit as soon as that line is linked. Such a pair is one unresolved unit, not two.
    */
@@ -488,11 +521,13 @@ export const EditMode: React.FC<EditModeProps> = ({
     commentaryLines.forEach((line, idx) => {
       const lineIdx1 = idx + 1;
       if (!line.trim() || linkedCommLineIndices.has(lineIdx1)) return;
+      if (isFrontMatterLine(lineIdx1)) return;
       const head = findPendingInheritanceHead(lineIdx1, links, commentaryLines);
-      if (head !== null) heads[lineIdx1] = head;
+      // A chain never reaches back into the front matter, which the parser skipped entirely.
+      if (head !== null && !isFrontMatterLine(head)) heads[lineIdx1] = head;
     });
     return heads;
-  }, [commentaryLines, links, linkedCommLineIndices]);
+  }, [commentaryLines, links, linkedCommLineIndices, isFrontMatterLine]);
 
   // Unlinked commentary lines. A בא"ד line waiting on the line above it is not counted on its
   // own — linking that line resolves both, so the frame is a single line to deal with.
@@ -503,12 +538,14 @@ export const EditMode: React.FC<EditModeProps> = ({
       if (!line.trim() || /<h[1-6][^>]*>.*<\/h[1-6]>/i.test(line) || /^#{1,6}\s+/.test(line)) {
         return;
       }
+      // Front matter is not "still to be linked" — there is nothing for it to link to.
+      if (isFrontMatterLine(lineIdx1)) return;
       if (!linkedCommLineIndices.has(lineIdx1) && pendingInheritanceHeads[lineIdx1] === undefined) {
         unlinked.push({ lineIndex1: lineIdx1, text: line });
       }
     });
     return unlinked;
-  }, [commentaryLines, linkedCommLineIndices, pendingInheritanceHeads]);
+  }, [commentaryLines, linkedCommLineIndices, pendingInheritanceHeads, isFrontMatterLine]);
 
   const commentarySegments = useMemo(() => {
     return parseDocumentSegments(commentaryLines.join('\n')).segments;
@@ -809,6 +846,14 @@ export const EditMode: React.FC<EditModeProps> = ({
 
   const draggedCommLineIdx = drag.state?.commLineIdx ?? null;
 
+  // Layout effect, not an effect: the flag has to be up before the browser lays out and
+  // delivers the ResizeObserver callback that this render triggers. Nothing needs a
+  // redraw when the session closes — a commit changes `links`, which the existing
+  // `updateSvgLines` effect already follows, and a cancel leaves the list untouched.
+  useLayoutEffect(() => {
+    isDragSessionOpenRef.current = drag.state !== null;
+  }, [drag.state]);
+
   const dragCandidates = useMemo(
     () => (draggedCommLineIdx === null ? [] : buildCandidatesFor(draggedCommLineIdx)),
     [draggedCommLineIdx, buildCandidatesFor]
@@ -829,13 +874,58 @@ export const EditMode: React.FC<EditModeProps> = ({
     return () => clearTimeout(timer);
   }, [justLinkedCommLineIdx]);
 
+  /**
+   * Row in the main list for a commentary line.
+   *
+   * Scoped to `containerRef` on purpose: the unlinked panel renders its own copy of every
+   * row it lists, with the same `comm-box-<n>` id, so a document-wide lookup can return
+   * the panel's copy instead — and that copy is detached the moment the panel closes,
+   * which makes scrolling it a silent no-op.
+   */
+  const findCommentaryRow = useCallback((lineIdx1: number) =>
+    containerRef.current?.querySelector<HTMLElement>(`[id="comm-box-${lineIdx1}"]`) ?? null,
+  []);
+
+  // Scroll to an unlinked commentary row and highlight it
+  const handleScrollToUnlinkedRow = useCallback((lineIdx1: number) => {
+    setIsUnlinkedPanelOpen(false);
+    // The panel lists every unlinked line, but the main list is filtered by the source
+    // search — so the row the user just asked for may not be rendered there at all.
+    // Dropping the filter is what makes "scroll to it" possible, and it is only dropped
+    // when the row really is missing.
+    if (!findCommentaryRow(lineIdx1)) setSourceSearchQuery('');
+    setPendingScrollLineIdx(lineIdx1);
+  }, [findCommentaryRow]);
+
+  // Runs once the render that reveals the row has been committed.
+  useEffect(() => {
+    if (pendingScrollLineIdx === null) return;
+    setPendingScrollLineIdx(null);
+
+    const element = findCommentaryRow(pendingScrollLineIdx);
+    if (!element) return;
+
+    element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+
+    const highlight = ['ring-2', 'ring-amber-400', 'dark:ring-amber-500', 'animate-pulse'];
+    element.classList.add(...highlight);
+    window.clearTimeout(highlightTimerRef.current);
+    highlightTimerRef.current = window.setTimeout(() => {
+      element.classList.remove(...highlight);
+    }, 1500);
+  }, [pendingScrollLineIdx, findCommentaryRow]);
+
+  useEffect(() => () => window.clearTimeout(highlightTimerRef.current), []);
+
   // Render a commentary line box
-  const renderCommentaryBox = (linkObj?: OtzariaLink, commIdx1?: number) => {
+  const renderCommentaryBox = (linkObj?: OtzariaLink, commIdx1?: number, onRowClick?: () => void) => {
     const lineIdx1 = linkObj ? linkObj.line_index_1 : commIdx1!;
     const rawLineText = commentaryLines[lineIdx1 - 1] || '';
     const highlight = dhHighlights[lineIdx1] || { wordStart: 0, wordCount: 3 };
 
     const isUnlinked = !linkObj;
+    // Front matter carries no link by design, so it is never dressed as a missing one.
+    const isFrontMatter = isUnlinked && isFrontMatterLine(lineIdx1);
     // A בא"ד line with no source is already part of a chain — it just has nothing to inherit
     // yet, and is marked as such so it never reads as an independent unlinked line.
     const pendingHead = isUnlinked ? pendingInheritanceHeads[lineIdx1] : undefined;
@@ -849,7 +939,9 @@ export const EditMode: React.FC<EditModeProps> = ({
     const inheritedFollowerCount = collectInheritedFollowers(lineIdx1, links, commentaryLines).length;
 
     let bgStyle = "bg-transparent text-[var(--color-on-surface)] border-[var(--color-outline-variant)]";
-    if (isUnlinked) {
+    if (isFrontMatter) {
+      bgStyle = "bg-transparent text-[var(--color-on-surface-variant)] border-dashed border-[var(--color-outline-variant)]";
+    } else if (isUnlinked) {
       bgStyle = "bg-rose-50/80 dark:bg-rose-950/30 text-rose-950 dark:text-rose-100 border-rose-300/80 dark:border-rose-900/60";
     } else if (isInherited) {
       bgStyle = "bg-[var(--color-surface-container-high)] text-[var(--color-on-surface)] border-[var(--color-outline)]";
@@ -863,7 +955,13 @@ export const EditMode: React.FC<EditModeProps> = ({
       <div
         id={`comm-box-${lineIdx1}`}
         key={`comm-${lineIdx1}`}
-        className={`group relative p-3 md:p-3.5 rounded-xl border shadow-2xs transition-all duration-200 ${bgStyle} hover:shadow-md hover:-translate-y-0.5 hover:border-[var(--color-primary)] space-y-2 ${isJustLinked ? 'otz-just-linked' : ''}`}
+        onClick={onRowClick && (event => {
+          // The row carries its own controls — the drag handle, the approval toggle, the
+          // edit button. Each owns its click; only the row's own surface scrolls.
+          if ((event.target as HTMLElement).closest('button, a, input, select, textarea')) return;
+          onRowClick();
+        })}
+        className={`group relative p-3 md:p-3.5 rounded-xl border shadow-2xs transition-all duration-200 ${bgStyle} hover:shadow-md hover:-translate-y-0.5 hover:border-[var(--color-primary)] space-y-2 ${isJustLinked ? 'otz-just-linked' : ''} ${onRowClick ? 'cursor-pointer' : ''}`}
       >
         {/* Top Indicators */}
         <div className="flex flex-wrap items-center justify-between gap-1.5 text-xs text-[var(--color-on-surface-variant)]">
@@ -897,8 +995,18 @@ export const EditMode: React.FC<EditModeProps> = ({
                 <span>ירושת הקשר</span>
               </span>
             )}
+            {/* Front matter — stated, not warned about: nothing here was meant to be linked */}
+            {isFrontMatter && (
+              <span
+                className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-[var(--color-surface-container-high)] text-[var(--color-on-surface-variant)] text-[10px] font-bold"
+                title={`שורה זו נמצאת לפני הכותרת המקבילה הראשונה (שורה ${linkingStartLine}), ולכן היא אינה מושווית למקור ואינה נדרשת לקישור`}
+              >
+                <Info className="w-3 h-3" />
+                <span>לפני תחילת ההשוואה</span>
+              </span>
+            )}
             {/* The waiting בא"ד line is not a warning of its own — the head above it carries it */}
-            {isUnlinked && !isPendingInheritance && (
+            {isUnlinked && !isFrontMatter && !isPendingInheritance && (
               <span
                 className="inline-flex items-center justify-center w-5 h-5 rounded-md bg-rose-200/90 dark:bg-rose-900/80 text-rose-900 dark:text-rose-100"
                 title="ללא מקור מקושר"
@@ -1065,6 +1173,9 @@ export const EditMode: React.FC<EditModeProps> = ({
           groupedCommentary.map((group, gIdx) => {
             const firstLinkObj = group.links[0];
             const firstCommIdx = group.commIndices[0];
+            // Front matter (see linkingStartLine): no source column verdict at all, since the
+            // parser never looked for one.
+            const isFrontMatterGroup = !firstLinkObj && isFrontMatterLine(firstCommIdx);
 
             return (
               <React.Fragment key={`comm-group-wrap-${group.targetKey}-${gIdx}`}>
@@ -1096,6 +1207,10 @@ export const EditMode: React.FC<EditModeProps> = ({
                             </span>
                           )}
                         </span>
+                      ) : isFrontMatterGroup ? (
+                        <span className="text-[var(--color-on-surface-variant)] font-bold">
+                          מחוץ לתחום ההשוואה
+                        </span>
                       ) : (
                         <>
                           <span>מקור מקושר</span>
@@ -1117,6 +1232,10 @@ export const EditMode: React.FC<EditModeProps> = ({
                         links={group.links}
                         targetType={targetType}
                       />
+                    ) : isFrontMatterGroup ? (
+                      <div className="p-5 rounded-xl border border-dashed border-[var(--color-outline-variant)] text-center text-xs text-[var(--color-on-surface-variant)]">
+                        שורות שלפני הכותרת המקבילה הראשונה (שורה {linkingStartLine}) אינן מושוות למקור.
+                      </div>
                     ) : (
                       <div className="p-5 rounded-xl border border-dashed border-[var(--color-outline)] text-center text-xs text-[var(--color-on-surface-variant)] space-y-1.5">
                         <div>אין מקור מקושר. לחץ על כפתור העריכה בכרטיס הפירוש כדי לקשר.</div>
@@ -1175,9 +1294,9 @@ export const EditMode: React.FC<EditModeProps> = ({
             {unlinkedCommLines.length > 0 && (
               <div className="p-3.5 space-y-2.5 overflow-y-auto">
                 <p className="text-xs text-[var(--color-on-surface-variant)] font-medium">
-                  לחץ עריכה כדי לקשר שורות פירוש ללא מקור:
+                  לחץ על השורה כדי לגלול אליה, או על כפתור העריכה כדי לקשר:
                 </p>
-                {unlinkedCommLines.map(un => renderCommentaryBox(undefined, un.lineIndex1))}
+                {unlinkedCommLines.map(un => renderCommentaryBox(undefined, un.lineIndex1, () => handleScrollToUnlinkedRow(un.lineIndex1)))}
               </div>
             )}
           </div>

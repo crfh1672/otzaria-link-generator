@@ -2,7 +2,7 @@ import React, { useState } from 'react';
 import { Save, FolderOpen, Download, ArrowLeftRight, RotateCcw, ListTree, Filter, Menu } from 'lucide-react';
 import JSZip from 'jszip';
 import { SessionState } from '../types';
-import { formatLineWithDH, parseDocumentSegments, normalizeText, areHeadersMatching, isHeaderLine } from '../utils/parserAlgorithm';
+import { formatLineWithDH, parseDocumentSegments, normalizeText, areHeadersMatching, isHeaderLine, findFirstAlignedSegmentIndex } from '../utils/parserAlgorithm';
 import { getWordSimilarity } from '../utils/fuzzyUtils';
 import { calculateDocumentIdfWeights, getCombinedWordWeight } from '../utils/wordWeights';
 import { notifySuccess, notifyError } from '../utils/otzariaBridge';
@@ -181,8 +181,17 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
       
       const unlinkedFolder = zip.folder("שורות_ללא_קישור");
       
+      // Front matter (everything before the first header with a counterpart in the source) is
+      // never searched by the parser, so it is not reported here as lines that failed to link.
+      const firstAlignedSegIdx = findFirstAlignedSegmentIndex(commDoc.segments, [
+        srcDoc.segments,
+        rashiDoc ? rashiDoc.segments : null,
+        tosafotDoc ? tosafotDoc.segments : null
+      ]);
+
       if (unlinkedFolder) {
-        commDoc.segments.forEach(commSeg => {
+        commDoc.segments.forEach((commSeg, segIdx) => {
+          if (firstAlignedSegIdx > 0 && segIdx < firstAlignedSegIdx) return;
           const srcSeg = srcDoc.segments.find(s => areHeadersMatching(commSeg.headerTitle, s.headerTitle));
           const rashiSeg = rashiDoc ? rashiDoc.segments.find(s => areHeadersMatching(commSeg.headerTitle, s.headerTitle)) : null;
           const tosafotSeg = tosafotDoc ? tosafotDoc.segments.find(s => areHeadersMatching(commSeg.headerTitle, s.headerTitle)) : null;

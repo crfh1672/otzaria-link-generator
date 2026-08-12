@@ -5,6 +5,7 @@ import { TopToolbar } from './components/TopToolbar';
 import { SetupMode } from './components/SetupMode';
 import { EditMode } from './components/EditMode';
 import { ProjectsModal } from './components/ProjectsModal';
+import { PointerDebugHud } from './components/PointerDebugHud';
 
 import { saveToCache, getFromCache, listCacheKeys, notifySuccess, notifyError } from './utils/otzariaBridge';
 
@@ -199,6 +200,8 @@ export default function App() {
         />
       )}
 
+      {/* Drag diagnostics — hidden until Ctrl+Alt+D (or #dragdebug in the URL) */}
+      <PointerDebugHud />
     </div>
   );
 }

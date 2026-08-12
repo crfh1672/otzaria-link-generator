@@ -46,6 +46,14 @@
   --radius-pill: 999px;
 }
 
+html {
+  /* Reserve the scrollbar track permanently. A drag locks the page with
+     `overflow: hidden`, and without a stable gutter that removal widens the viewport:
+     the content jumps sideways and every observed card reports a resize, forcing a
+     connector-line recalculation on the frame that has to raise the drag overlay. */
+  scrollbar-gutter: stable;
+}
+
 body {
   font-family: var(--font-main);
   font-size: var(--font-size-base);
@@ -165,9 +173,14 @@ body.dark-mode {
   100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
 }
 
-.otz-fade-in,
 .animate-fade-in {
   animation: otz-fade-in 0.16s ease-out both;
+}
+
+/* The scrim is the drag's acknowledgement that the gesture was picked up, so it is
+   deliberately faster than the general fade — anything slower reads as lag. */
+.otz-fade-in {
+  animation: otz-fade-in 0.08s ease-out both;
 }
 
 .otz-drag-rise {

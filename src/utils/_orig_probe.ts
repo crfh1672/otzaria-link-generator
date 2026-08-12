@@ -477,13 +477,6 @@ const RASHI_KEYWORDS = [
 const TOSAFOT_KEYWORDS = [
   // With ד"ה / בד"ה — longest first
   'בתוספות ד"ה', 'בתוספות בד"ה', 'תוספות ד"ה', 'תוספות בד"ה',
-  // "בתוספת" — פני יהושע's spelling of the name ("בתוספת בד\"ה מפני שמזיז …"). It used to be
-  // caught only by accident, as a prefix of the bare 'בתוס' under the old unbounded startsWith;
-  // once that became a whole-word test (startsWithSourceKeyword) the spelling had to be named
-  // here explicitly. Listed ONLY in its ד"ה forms: bare "בתוספת" is also the ordinary Hebrew
-  // word for "in addition", and routing that to Tosafot as an explicit citation would skip the
-  // primary-source search for any line that happens to open with it.
-  'בתוספת ד"ה', 'בתוספת בד"ה', 'תוספת ד"ה', 'תוספת בד"ה',
   'בתוסות ד"ה',  'בתוסות בד"ה',  'תוסות ד"ה',  'תוסות בד"ה',
   'בתוס\' ד"ה',  'בתוס\' בד"ה',  'תוס\' ד"ה',  'תוס\' בד"ה',
   'בתוס ד"ה',   'בתוס בד"ה',   'תוס ד"ה',   'תוס בד"ה',
@@ -509,15 +502,8 @@ function toPrefixAlternation(keywords: string[]): string {
 const RASHI_PREFIX_ALTS = toPrefixAlternation(RASHI_KEYWORDS);
 const TOSAFOT_PREFIX_ALTS = toPrefixAlternation(TOSAFOT_KEYWORDS);
 
-/**
- * "Not followed by another Hebrew letter" — the word boundary every source-name test needs.
- * See startsWithSourceKeyword below for why; the same assertion is spliced into the strip
- * regex so stripping and routing can never disagree about where a source name ends.
- */
-const NOT_HEBREW_LETTER_AHEAD = '(?![\\u05D0-\\u05EA])';
-
 const SECONDARY_PREFIX_STRIP_RE = new RegExp(
-  `^(?:${RASHI_PREFIX_ALTS}|${TOSAFOT_PREFIX_ALTS}|שם\\s+ד"ה|או"ד|באו"ד|א"ד|בא"ד|אד|באד|אוד|באוד|בד"ה|בדה)${NOT_HEBREW_LETTER_AHEAD}\\s*[:.\\-]?\\s*`,
+  `^(?:${RASHI_PREFIX_ALTS}|${TOSAFOT_PREFIX_ALTS}|שם\\s+ד"ה|או"ד|באו"ד|א"ד|בא"ד|אד|באד|אוד|באוד|בד"ה|בדה)\\s*[:.\\-]?\\s*`,
   'i'
 );
 
@@ -563,31 +549,6 @@ const GEMARA_KEYWORDS_NORM: string[] = [...new Set(GEMARA_KEYWORDS.map(_normaliz
 const MISHNA_KEYWORDS_NORM: string[] = [...new Set(MISHNA_KEYWORDS.map(_normalizeKw))]
   .sort((a, b) => b.length - a.length);
 
-const HEBREW_LETTER_RE = /[א-ת]/;
-
-/**
- * Whether `line` opens with one of `keywords` AS A WHOLE WORD.
- *
- * BUG: the source-name lists contain bare, very short forms ('תו', 'בתו', 'תוס', 'רשי'), and a
- * plain `startsWith` cannot tell a source name from an ordinary word that merely begins with the
- * same letters. A commentary line opening "בתולה נשאת ליום הרביעי" starts with 'בתו', so it was
- * read as an EXPLICIT citation of Tosafot, and every consequence of that verdict followed:
- *   • the primary-source search is skipped outright (the `!explicitSecondaryTarget` gate), so the
- *     Gemara — where the line actually belongs — is never even consulted;
- *   • stripSecondaryPrefix cuts the keyword off mid-word, leaving "לה נשאת ליום הרביעי" as the
- *     Dibur Hamatchil ("תורה" → "רה", "רשימת" → "מת");
- *   • being explicit engages the flexibility ladder meant for real citations, which relaxes the
- *     search until *something* matches — landing on whichever Tosafot line shares a phrase;
- *   • previousSecondaryType is left pointing at Tosafot, so every following ד"ה / בא"ד line
- *     inherits the wrong document too.
- * Requiring that no Hebrew letter follow the keyword is what separates the two. Nothing legitimate
- * is lost: the lists are matched with `.some`, so a form like בתוד"ה is still recognised by its own
- * longer entry even though 'בתו' alone is now rejected in front of the ד.
- */
-function startsWithSourceKeyword(line: string, keywords: string[]): boolean {
-  return keywords.some(kw => line.startsWith(kw) && !HEBREW_LETTER_RE.test(line.charAt(kw.length)));
-}
-
 /**
  * Regex that strips a leading "source context" word (גמרא/גמ'/משנה/מתני' etc.)
  * from the start of a commentary line before checking for secondary-source keywords.
@@ -596,10 +557,7 @@ function startsWithSourceKeyword(line: string, keywords: string[]): boolean {
  *           "משנה רש"י ד"ה אמרי" → strip "משנה" → "רש"י ד"ה אמרי" → route to Rashi.
  *           "גמ' ..." (no secondary keyword after) → keep original, route to primary source.
  */
-// The trailing "no Hebrew letter ahead" is the same whole-word requirement the source-name lists
-// carry (see startsWithSourceKeyword): without it "משנהו של מלך" is stripped down to "ו של מלך",
-// exactly as "בתולה" was cut to "לה" by the Tosafot name.
-const SOURCE_CONTEXT_STRIP_RE = /^(?:בגמרא|גמרא|בגמ'|גמ'|בפיסקא|פיסקא|במשנה|משנה|מתניתין|מתניתן|מתני')(?![א-ת])\s*[:.\-]?\s*/i;
+const SOURCE_CONTEXT_STRIP_RE = /^(?:בגמרא|גמרא|בגמ'|גמ'|בפיסקא|פיסקא|במשנה|משנה|מתניתין|מתניתן|מתני')\s*[:.\-]?\s*/i;
 
 /** Leading numbering / bullet / bracketed note, e.g. "3." "(א)" "[הגהה]" "•". */
 const LEADING_BULLET_STRIP_RE = /^(?:\d+[\.\)]|[ א-ת][\.\)]|\([^)]+\)|\[[^\]]+\]|[•\-\*])\s*/;
@@ -730,8 +688,8 @@ export function isBareSourceLabelLine(line: string): boolean {
     .trim();
   const lineForKeywordCheck = stripLeadingMarkers(cleanedPrefix) || cleanedPrefix || normalized;
 
-  const namesSecondary = startsWithSourceKeyword(lineForKeywordCheck, RASHI_KEYWORDS_NORM)
-    || startsWithSourceKeyword(lineForKeywordCheck, TOSAFOT_KEYWORDS_NORM);
+  const namesSecondary = RASHI_KEYWORDS_NORM.some(kw => lineForKeywordCheck.startsWith(kw))
+    || TOSAFOT_KEYWORDS_NORM.some(kw => lineForKeywordCheck.startsWith(kw));
 
   return namesSecondary && !stripSecondaryPrefix(line.trim()).trim();
 }
@@ -818,62 +776,6 @@ export function parseDocumentSegments(rawText: string): { lines: string[]; segme
   }
 
   return { lines, segments };
-}
-
-/**
- * Index of the first commentary segment whose header has a counterpart ("כותרת מקבילה") in any
- * of the target documents, or -1 when no commentary header matches anything.
- *
- * Everything before that segment is the commentary's front matter — a title page, an approbation,
- * an author's preface, a general introduction. Such text quotes nothing in particular, yet the
- * search would still run over it: a commentary segment with no matching source segment falls back
- * to scanning the ENTIRE target document (`srcSeg ? srcSeg.startLine : 1`), so the preface was
- * being matched against the whole book and handed whatever line happened to share vocabulary
- * with it. Those links are noise by construction — there is nothing there to link to.
- *
- * -1 (no header matches at all) deliberately means "no front matter": documents with no headers,
- * or whose headers are written in a form the matcher does not recognise, must keep being linked
- * exactly as before rather than being skipped in their entirety.
- */
-export function findFirstAlignedSegmentIndex(
-  commSegments: HeaderSegment[],
-  targetSegmentLists: (HeaderSegment[] | null | undefined)[]
-): number {
-  return commSegments.findIndex(commSeg =>
-    targetSegmentLists.some(list =>
-      !!list && list.some(s => areHeadersMatching(commSeg.headerTitle, s.headerTitle))
-    )
-  );
-}
-
-/**
- * First commentary line (1-based) that takes part in linking — everything above it is front
- * matter, per findFirstAlignedSegmentIndex. Returns 1 when there is no front matter.
- *
- * The editor calls this to reproduce the parser's own boundary, so a front-matter line is not
- * reported as an unlinked line the user still has to deal with.
- */
-export function findLinkingStartLine(
-  commentaryLines: string[],
-  sourceLines: string[],
-  rashiLines?: string[],
-  tosafotLines?: string[]
-): number {
-  if (!commentaryLines || commentaryLines.length === 0) return 1;
-
-  const commSegments = parseDocumentSegments(commentaryLines.join('\n')).segments;
-  const segmentsOf = (lines?: string[]) =>
-    lines && lines.length > 0 ? parseDocumentSegments(lines.join('\n')).segments : null;
-
-  const firstAligned = findFirstAlignedSegmentIndex(commSegments, [
-    segmentsOf(sourceLines),
-    segmentsOf(rashiLines),
-    segmentsOf(tosafotLines)
-  ]);
-  if (firstAligned <= 0) return 1;
-
-  const seg = commSegments[firstAligned];
-  return seg.headerLineIndex > 0 ? seg.headerLineIndex : seg.startLine;
 }
 
 /**
@@ -1902,21 +1804,7 @@ export function runLinkingParser(
   let carriedLink: OtzariaLink | null = null;
   let carriedInheritDepth = 0;
 
-  // Front matter: every commentary segment before the first one whose header has a counterpart in
-  // a target document is skipped outright — not searched, not linked, and left out of the
-  // inheritance chain (see findFirstAlignedSegmentIndex for why, and what -1 means).
-  const firstAlignedSegIdx = findFirstAlignedSegmentIndex(commDoc.segments, [
-    srcDoc.segments,
-    rashiDoc ? rashiDoc.segments : null,
-    tosafotDoc ? tosafotDoc.segments : null
-  ]);
-  if (DEBUG && firstAlignedSegIdx > 0) {
-    console.log(`  ⏭️  Skipping ${firstAlignedSegIdx} front-matter segment(s) before the first matching header '${commDoc.segments[firstAlignedSegIdx].headerTitle}'`);
-  }
-
-  commDoc.segments.forEach((commSeg, segIdx) => {
-    if (firstAlignedSegIdx > 0 && segIdx < firstAlignedSegIdx) return;
-
+  commDoc.segments.forEach(commSeg => {
     const opensWithBaad = firstContentLineIsBaad(commDoc.lines, commSeg.startLine);
     let previousLink: OtzariaLink | null = opensWithBaad ? carriedLink : null;
     // How many inheritance hops separate previousLink from the last link that was matched on
@@ -1970,11 +1858,11 @@ export function runLinkingParser(
       let targetSecondary: 'rashi' | 'tosafot' | null = null;
       let explicitSecondaryTarget = false;
 
-      if (startsWithSourceKeyword(lineForKeywordCheck, RASHI_KEYWORDS_NORM)) {
+      if (RASHI_KEYWORDS_NORM.some(kw => lineForKeywordCheck.startsWith(kw))) {
         targetSecondary = 'rashi';
         explicitSecondaryTarget = true;
         if (DEBUG) console.log(`  ✅ Detected Rashi keyword. normalizedPrefixLine='${normalizedPrefixLine}'`);
-      } else if (startsWithSourceKeyword(lineForKeywordCheck, TOSAFOT_KEYWORDS_NORM)) {
+      } else if (TOSAFOT_KEYWORDS_NORM.some(kw => lineForKeywordCheck.startsWith(kw))) {
         targetSecondary = 'tosafot';
         explicitSecondaryTarget = true;
         if (DEBUG) console.log(`  ✅ Detected Tosafot keyword. normalizedPrefixLine='${normalizedPrefixLine}'`);
@@ -2007,9 +1895,7 @@ export function runLinkingParser(
       // suppress silent inheritance when such an explicit reference fails to find a match.
       let explicitPrimaryTarget = false;
       if (!targetSecondary) {
-        // Same whole-word requirement as the secondary lists above — "משנהו"/"גמרתי" must not
-        // register as an explicit primary citation and pull in the flexibility ladder.
-        if (startsWithSourceKeyword(cleanedPrefix, GEMARA_KEYWORDS_NORM) || startsWithSourceKeyword(cleanedPrefix, MISHNA_KEYWORDS_NORM)) {
+        if (GEMARA_KEYWORDS_NORM.some(kw => cleanedPrefix.startsWith(kw)) || MISHNA_KEYWORDS_NORM.some(kw => cleanedPrefix.startsWith(kw))) {
           explicitPrimaryTarget = true;
           if (DEBUG) console.log(`  ✅ Detected explicit primary-source keyword (Gemara/Mishna). cleanedPrefix='${cleanedPrefix}'`);
         }

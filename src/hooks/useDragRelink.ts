@@ -18,6 +18,7 @@
  */
 
 import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { traceDrag } from '../utils/dragTrace';
 
 export type DragMode = 'pointer' | 'keyboard';
 
@@ -66,6 +67,13 @@ interface PointerSession {
   x: number;
   y: number;
   activated: boolean;
+  /**
+   * Whether `PointerEvent.buttons` can be believed for this session — see the guard in
+   * `handlePointerMove`. Hosts that forward synthesized mouse input (Otzaria renders the
+   * plugin in an offscreen webview) report `buttons: 0` on every move, which would read
+   * as "the button was already released" and kill the press before it becomes a drag.
+   */
+  trustButtons: boolean;
   /** Element holding pointer capture, so it can be released on every exit path. */
   captureElement: HTMLElement | null;
 }
@@ -147,6 +155,7 @@ export function useDragRelink({
 
   /** Mirrors every session change into the ref synchronously, then re-renders. */
   const openSession = useCallback((next: DragRelinkState, initialDropId: string | null) => {
+    traceDrag(`openSession: ${next.mode} on comm line ${next.commLineIdx} — overlay should mount`);
     stateRef.current = next;
     setActiveDropId(initialDropId);
     setState(next);
@@ -334,7 +343,12 @@ export function useDragRelink({
 
     // No open session: a press that never crossed the drag threshold, or a duplicate
     // end (pointerup racing a window blur). Nothing to commit or announce.
-    if (!session) return;
+    if (!session) {
+      traceDrag(`end: nothing open (commit=${commit})`);
+      return;
+    }
+
+    traceDrag(`end: ${commit && dropId ? `committed to ${dropId}` : 'cancelled'}`);
 
     if (session.mode === 'pointer') suppressNextClickRef.current = true;
 
@@ -397,7 +411,13 @@ export function useDragRelink({
         // The button was released where we never saw the `pointerup` (outside the
         // window, or swallowed by the host app). Without this the pending press would
         // block every future drag.
-        if (event.pointerType === 'mouse' && event.buttons === 0) {
+        //
+        // Only trustworthy when the host reported a pressed button on `pointerdown` in
+        // the first place: an embedding webview that forwards mouse input can drop the
+        // button state from moves, and reading that as a release would mean no press
+        // ever survives long enough to become a drag.
+        if (event.pointerType === 'mouse' && session.trustButtons && event.buttons === 0) {
+          traceDrag('move: dropped the press — buttons=0 reads as released');
           discardPendingPress();
           return;
         }
@@ -406,6 +426,7 @@ export function useDragRelink({
         const dy = event.clientY - session.startY;
         if (Math.hypot(dx, dy) < ACTIVATION_DISTANCE) return;
 
+        traceDrag(`move: threshold crossed at ${Math.round(Math.hypot(dx, dy))}px — activating`);
         session.activated = true;
         lockPageInteraction('grabbing');
         openSession({ commLineIdx: session.commLineIdx, mode: 'pointer' }, null);
@@ -583,9 +604,24 @@ export function useDragRelink({
    */
   const getHandleProps = useCallback((commLineIdx: number) => ({
     onPointerDown: (event: React.PointerEvent<HTMLElement>) => {
-      if (event.button !== 0) return;             // primary button / touch / pen only
-      if (pointerRef.current) return;             // ignore a second concurrent pointer
-      if (stateRef.current) return;               // a session is already open
+      if (event.button !== 0) {                   // primary button / touch / pen only
+        traceDrag(`down: ignored — button=${event.button}`);
+        return;
+      }
+      if (stateRef.current) {
+        traceDrag('down: ignored — a session is already open');
+        return;                                   // a session is already open
+      }
+
+      // A press that never became a drag and never saw its release — the safety net in
+      // `handlePointerMove` cannot run when the host does not report button state — must
+      // not block this one. A live drag still owns the pointer and is left alone.
+      if (pointerRef.current?.activated) {
+        traceDrag('down: ignored — a drag already owns the pointer');
+        return;                                   // ignore a second concurrent pointer
+      }
+      discardPendingPress();
+      traceDrag(`down: accepted on line ${commLineIdx} (buttons=${event.buttons}, ${event.pointerType}) — waiting for ${ACTIVATION_DISTANCE}px`);
 
       const handle = event.currentTarget;
       let captureElement: HTMLElement | null = null;
@@ -608,18 +644,27 @@ export function useDragRelink({
         x: event.clientX,
         y: event.clientY,
         activated: false,
+        // A real browser reports `buttons: 1` for the press that just happened. A host
+        // that reports 0 here cannot report it on moves either, so the release heuristic
+        // is switched off for this session rather than fed garbage.
+        trustButtons: event.buttons !== 0,
         captureElement
       };
     },
     /** A plain click (a press that never became a drag) opens the keyboard picker. */
     onClick: (event: React.MouseEvent<HTMLElement>) => {
       if (suppressNextClickRef.current) {
+        traceDrag('click: swallowed — it trails a completed drag');
         suppressNextClickRef.current = false;
         event.preventDefault();
         event.stopPropagation();
         return;
       }
-      if (pointerRef.current || stateRef.current) return;
+      if (pointerRef.current || stateRef.current) {
+        traceDrag('click: ignored — a press or session is still open');
+        return;
+      }
+      traceDrag(`click: opening the picker for line ${commLineIdx}`);
       startKeyboard(commLineIdx);
     },
     onKeyDown: (event: React.KeyboardEvent<HTMLElement>) => {
@@ -633,7 +678,7 @@ export function useDragRelink({
       WebkitTouchCallout: 'none' as const,
       WebkitUserSelect: 'none' as const
     }
-  }), [startKeyboard]);
+  }), [discardPendingPress, startKeyboard]);
 
   /**
    * View-driven selection (hover / click on a row). Ignored while a pointer drag owns
