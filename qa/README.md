@@ -44,6 +44,31 @@ node --import tsx qa/differential.ts
 performance work (only their import paths were rewritten so both versions can be loaded at
 once). They exist solely as the reference for this test — the plugin never imports them.
 
+## Confidence calibration — `qa/confidence.ts`
+
+The percentage shown next to a link is display-only — it never affects which line the engine
+picks — but it is supposed to mean something: links reported at 90% should be right about 90%
+of the time.
+
+```bash
+node --max-old-space-size=8192 --import tsx qa/confidence.ts report   # reliability curve
+node --max-old-space-size=8192 --import tsx qa/confidence.ts fit      # re-derive CAL_A / CAL_B
+```
+
+`report` prints the confidence distribution, the reliability curve (per band: reported vs.
+actually correct, and the resulting ECE), and the precision you get from each possible
+approve/pending threshold. `fit` re-runs the Platt scaling and prints the two constants to
+paste back into `CONF` in `src/utils/parserAlgorithm.ts`.
+
+**Re-run `fit` after changing any confidence weight**, or the reported percentages drift away
+from the frequencies they claim to describe.
+
+Correctness is judged independently of the matcher: the Dibur Hamatchil and the line it points
+at must share ≥3 consecutive words verbatim, by plain string equality — no fuzzy matching,
+stems, weights or abbreviation expansion. The judge cannot fairly score *inherited* links (a
+בא"ד line inherits because it has no quotation of its own), so those are reported separately
+and their figures are a floor, not an estimate.
+
 ## Profiling
 
 ```bash

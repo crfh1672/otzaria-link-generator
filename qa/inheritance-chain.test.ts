@@ -2,7 +2,7 @@
  * Context inheritance ("ירושת הקשר") in the editor: re-linking a line must drag the lines
  * that inherit their context from it to the new target, and only those — the chain stops at
  * the next line that owns its target, at a line that found no source and does not say בא"ד,
- * and at a header.
+ * and at a header, unless the first content line after that header itself says בא"ד.
  *
  * Also covers the waiting state: a בא"ד line under a line that found no source belongs to
  * that line's frame, and receives its inherited link the moment that line is linked.
@@ -33,7 +33,7 @@ const commentaryLines = [
   'שורה רגילה ב',  // 6 root
   'בא"ד שוב',      // 7 inherited
   '# פרק שני',     // 8 header
-  'בא"ד אחרי כותרת' // 9 inherited (different segment)
+  'בא"ד אחרי כותרת' // 9 inherited across the header — it opens the new segment with בא"ד
 ];
 
 const links: OtzariaLink[] = [
@@ -53,12 +53,18 @@ const eq = (name: string, actual: unknown, expected: unknown) => {
 };
 
 eq('followers of 2 = [3,5] (blank skipped, stops at root 6)', collectInheritedFollowers(2, links, commentaryLines), [3, 5]);
-eq('followers of 6 = [7] (stops at header)', collectInheritedFollowers(6, links, commentaryLines), [7]);
+eq('followers of 6 = [7,9] (בא"ד opens the next segment, so the chain crosses the header)', collectInheritedFollowers(6, links, commentaryLines), [7, 9]);
 eq('followers of 3 = [5]', collectInheritedFollowers(3, links, commentaryLines), [5]);
 eq('followers of 9 = []', collectInheritedFollowers(9, links, commentaryLines), []);
 eq('parent of 5 = 2', findInheritanceParent(5, links, commentaryLines), 2);
 eq('parent of 7 = 6', findInheritanceParent(7, links, commentaryLines), 6);
-eq('parent of 9 = null (header above)', findInheritanceParent(9, links, commentaryLines), null);
+eq('parent of 9 = 6 (climbs over the header to the head of the chain)', findInheritanceParent(9, links, commentaryLines), 6);
+
+// The same header, with an ordinary line opening the next segment: nothing crosses it.
+const cutLines = [...commentaryLines.slice(0, 8), 'שורה רגילה אחרי כותרת'];
+eq('followers of 6 stop at the header when the next segment does not open with בא"ד',
+  collectInheritedFollowers(6, links, cutLines), [7]);
+eq('parent of 9 = null when line 9 is not בא"ד', findInheritanceParent(9, links, cutLines), null);
 
 // Re-link line 2 -> 21: lines 3 and 5 follow; 6,7,9 untouched.
 const relinked = links.map(l => (l.line_index_1 === 2 ? { ...l, line_index_2: 21, confidence: 100 } : l));
@@ -88,6 +94,35 @@ const sec = links.map(l => (l.line_index_1 === 6
 const after4 = cascadeInheritedContext({ links: sec, commentaryLines, parentLineIdx1: 6, sourceLines, rashiLines: sourceLines });
 const f7 = after4.find(l => l.line_index_1 === 7)!;
 eq('secondary fields propagate', [f7.line_index_2, f7.secondaryTarget, f7.secondary_line_index, f7.path_2], [4, 'rashi', 4, 'רש"י על ברכות.txt']);
+const f9 = after4.find(l => l.line_index_1 === 9)!;
+eq('secondary fields propagate across the header too', [f9.line_index_2, f9.secondaryTarget, f9.path_2], [4, 'rashi', 'רש"י על ברכות.txt']);
+
+/* ------------------------------------------------------------------------------------------
+ * A bare source label ("פרש"י" with no ד"ה and no text of its own). The parser skips such a
+ * line before it decides link / no link, so it takes no link and does not sever the chain —
+ * the editor has to read it the same way, or a re-link would not reach past it.
+ * ---------------------------------------------------------------------------------------- */
+
+const labelLines = [
+  '# פרק ראשון',   // 1 header
+  'שורה רגילה א',   // 2 root
+  '<b>פרש"י</b>',   // 3 bare label — skipped by the parser
+  'בא"ד ממשיך',     // 4 inherits from 2, across the label
+  'שורה ללא מקור',  // 5 not a label and not בא"ד — really does end the chain
+  'בא"ד אחר כך',    // 6 waits on 5
+];
+const labelLinks: OtzariaLink[] = [L(2, 10, false), L(4, 10, true)];
+
+eq('the chain reaches past a bare source label', collectInheritedFollowers(2, labelLinks, labelLines), [4]);
+eq('a bare label is not the parent of the line under it', findInheritanceParent(4, labelLinks, labelLines), 2);
+eq('a line that is not a label still ends the chain', collectInheritedFollowers(4, labelLinks, labelLines), []);
+eq('the בא"ד line under the sourceless line waits on it', findPendingInheritanceHead(6, labelLinks, labelLines), 5);
+eq('a label the user linked by hand owns its target like any other line',
+  collectInheritedFollowers(2, [...labelLinks, L(3, 12, false)], labelLines), []);
+
+// Re-linking line 2 must drag line 4 with it, over the label.
+const afterLabel = cascadeInheritedContext({ links: labelLinks.map(l => (l.line_index_1 === 2 ? { ...l, line_index_2: 21 } : l)), commentaryLines: labelLines, parentLineIdx1: 2, sourceLines });
+eq('re-linking drags the line past the label', afterLabel.map(l => [l.line_index_1, l.line_index_2]), [[2, 21], [4, 21]]);
 
 /* ------------------------------------------------------------------------------------------
  * A בא"ד line whose predecessor found no source: the two wait together, and linking the

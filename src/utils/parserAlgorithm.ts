@@ -97,66 +97,228 @@ function computeDynamicMinThreshold(
 }
 
 /**
- * Calculates a confidence score (0-100%) for a generated link.
- */
-/**
- * Confidence ceilings applied to links that were only found via the "flexibility ladder"
- * retry mechanism (see attemptFlexibleRetry in runLinkingParser). The ladder is only ever
- * triggered for lines carrying an EXPLICIT reference to a target (רש"י ד"ה / תוס' בד"ה / גמ')
- * whose strict initial search failed — so these matches are never treated as pure noise, but
- * since the text-match itself came from progressively relaxed rules, confidence is capped
- * below what a direct strict match would earn. Earlier rungs (milder relaxation) keep a
- * higher ceiling than later rungs (more relaxation = weaker textual evidence).
+ * Which rung of the explicit-reference flexibility ladder produced a match
+ * (see attemptFlexibleRetry in runLinkingParser).
  */
 export type RetryRung = 'A' | 'B' | 'C' | 'D';
-const RETRY_CONFIDENCE_CAPS: Record<RetryRung, number> = {
-  A: 82, // Rung A: only dropped the "must start at word 0" restriction
-  B: 78, // Rung B: also neutralized IDF word-weighting
-  C: 72, // Rung C: also widened the search to neighboring segments
-  D: 65  // Rung D: also lowered the acceptance threshold — weakest evidence
+
+/**
+ * ── Confidence: what the number means, and why it is shaped like this ────────────────────
+ *
+ * The percentage shown next to a link is a DISPLAY value. It never feeds back into the
+ * matcher: which line a commentary line links to is decided entirely by the search functions
+ * and computeDynamicMinThreshold, and nothing below is consulted there. Changing this model
+ * changes what the reviewer is told, never what the engine produced or what gets exported
+ * (`_links.json` / `_links.csv` carry only the indices and refs).
+ *
+ * THE OLD MODEL AND WHY IT COLLAPSED
+ * It reduced everything to `matchScore / expectedWeight` and cut that into four tiers
+ * (96/88/76/60). Those two quantities are not on a common scale:
+ *   • matchScore     — weight of the best CONTIGUOUS RUN, bounded by maxDhWords (≤12 words).
+ *   • expectedWeight — weight of EVERY word of the commentary phrase, unbounded.
+ * Measured over פני יהושע/ברכות the median expectedWeight is 180 against a median matchScore
+ * of 25, so the median ratio was 0.14 and 91% of links fell under the lowest tier's 0.55 cut:
+ * 77.6% of all links displayed exactly 60%, 20.2% displayed the flat inherited 75%, and the
+ * three real tiers shared the remaining 2.2%. The ratio was measuring "what fraction of this
+ * paragraph is a quotation" — a property of the commentator's writing style — rather than
+ * "how good is this match". Worse, every candidate in a link's top-3 list received an
+ * identical percentage (100% of multi-candidate links), so the number could not help a
+ * reviewer choose between alternatives at all.
+ *
+ * THE MODEL
+ * Six normalised, independently meaningful signals are combined in LOG-ODDS space and passed
+ * through a logistic. Continuity is structural: every input is continuous, so the output is
+ * too, and no input can pin the result to a constant.
+ *
+ *   coverage   matched weight ÷ weight of the words the matcher was ALLOWED to compare (the
+ *              first maxDhWords). This is the denominator fix — a number that can actually
+ *              reach 1.0 — and on its own it accounts for most of the spread.
+ *   runF       contiguous matched word count, saturating (1-e^(-n/k)). Nine verbatim words
+ *              are near-proof regardless of how long the surrounding paragraph is; the old
+ *              model only had a cliff at ≤2 words and was blind above it.
+ *   meanSim    mean per-word similarity across the run. The weighted sum melted exactness
+ *              into magnitude, so five verbatim words and five fuzzy ones (0.75 each) were
+ *              indistinguishable. Centred on 0.90 because a stem match scores 0.92.
+ *   info       mean IDF/stop-word weight of the matched words. Matching "אמר רבי יוחנן"
+ *              (three stop-words, 0.35 each) is weak evidence; matching "מרגלא בפומיה" is
+ *              strong. Both used to contribute to the same undifferentiated sum.
+ *   margin     (winner − runner-up) ÷ winner, from the top-K list that was already being
+ *              collected and then discarded. This is the signal the old model lacked
+ *              entirely: it separates "this line matches well" from "this line matches
+ *              better than every rival". Two lines scoring 8.2 and 8.1 mean the text was
+ *              found but the CHOICE is a coin flip — and it is what finally gives the
+ *              candidate dropdown three different numbers.
+ *   exactPhrase  the search phrase occurred verbatim in the target line.
+ *
+ * Retry rungs and inheritance became PENALTIES IN LOG-ODDS instead of `Math.min` ceilings.
+ * A hard cap is wrong in both directions: it dragged an overwhelming match found on rung C
+ * down to exactly 72, and it silently RAISED a threadbare rung-A match up to 82. A penalty
+ * preserves the ordering of the underlying evidence.
+ *
+ * An inherited link (שם / בא"ד) no longer reports a flat 75. It inherits its parent's
+ * confidence and decays it once per hop, so a שם sitting six lines below a shaky link is
+ * finally distinguishable from one directly under a certain one.
+ */
+
+/** Evidence gathered by a search function about the match it returned. Display-only. */
+export interface MatchEvidence {
+  /** Weight of the matched contiguous run (numerator). */
+  matchedWeight: number;
+  /** Weight of the words the matcher was allowed to compare — the comparison window. */
+  windowWeight: number;
+  /** Length in words of the matched contiguous run. */
+  runWords: number;
+  /** Sum of per-word similarities across that run (÷ runWords = mean exactness). */
+  simSum: number;
+  /** Ranking score of the winning line. */
+  winnerScore: number;
+  /** Best ranking score among the rivals that also cleared the acceptance threshold. */
+  runnerUpScore: number;
+  /** The search phrase was found verbatim in the target line. */
+  exactPhrase: boolean;
+}
+
+export const EMPTY_EVIDENCE: MatchEvidence = {
+  matchedWeight: 0, windowWeight: 0, runWords: 0, simSum: 0,
+  winnerScore: 0, runnerUpScore: 0, exactPhrase: false
 };
 
-export function calculateLinkConfidence(
-  isInherited: boolean,
-  matchScore: number,
-  wordLength: number,
-  isExplicit: boolean,
-  expectedWeight?: number,
-  matchedWordCount?: number,
-  retryRung?: RetryRung | null
-): number {
-  const applyRetryCap = (value: number): number =>
-    retryRung ? Math.min(value, RETRY_CONFIDENCE_CAPS[retryRung]) : value;
+/**
+ * Coefficients. Centres are the "neutral" value of each feature — a match sitting exactly at
+ * every centre lands on B0. Tuned against the reliability measurement in qa/confidence.ts;
+ * see the calibration note there before changing any of them.
+ */
+const CONF = {
+  B0: 0.35,
+  W_COVERAGE: 3.20, C_COVERAGE: 0.50,
+  W_RUN: 2.40, C_RUN: 0.55,
+  W_SIM: 2.60, C_SIM: 0.90,
+  W_INFO: 1.10, C_INFO: 0.55,
+  W_MARGIN: 1.70, C_MARGIN: 0.35,
+  W_EXACT: 1.15,
+  W_EXPLICIT: 0.45,
+  /** Words of contiguous run at which runF reaches 1-1/e. */
+  RUN_SCALE: 3.5,
+  /** Maximum per-word combined weight — getCombinedWordWeight's upper bound. */
+  MAX_WORD_WEIGHT: 1.30,
+  /** Log-odds subtracted per flexibility-ladder rung. */
+  RUNG_PENALTY: { A: 0.45, B: 0.80, C: 1.25, D: 1.85 } as Record<RetryRung, number>,
 
-  if (isInherited) {
-    return applyRetryCap(75); // Inherited context / שם / בא"ד
+  /**
+   * CALIBRATION — the step that makes the percentage a percentage.
+   *
+   * The weights above express which evidence matters and by how much RELATIVE to the rest;
+   * they say nothing about what absolute frequency a given z corresponds to. Uncalibrated,
+   * the model was right about the ordering but far too sure of itself: it reported a mean of
+   * 93.8% over links that a verbatim check found correct 78.1% of the time, and 30% of all
+   * links sat at 99%.
+   *
+   * These two numbers apply Platt scaling, z' = A·z + B, fitted by gradient descent on 895
+   * matched links from three commentary/tractate pairs (פני יהושע on ברכות and on שבת,
+   * בן יהוידע on ברכות). The label is deliberately NOT one of the model's own features: it is
+   * whether the Dibur Hamatchil and the line it points at share at least three CONSECUTIVE
+   * words verbatim — plain string equality, no fuzzy matching, no stems, no weights, no
+   * abbreviation expansion. Result: expected calibration error 8.9 → 2.4 points, log-loss
+   * 0.492 → 0.426.
+   *
+   * Only two parameters are fitted, and that is on purpose. They can slide and stretch the
+   * scale onto the observed frequencies but cannot re-rank anything, so the domain reasoning
+   * in the weights survives intact and there is nothing for the proxy label to overfit.
+   *
+   * A < 1 means the raw model was over-sharp: it pushed cases to the extremes harder than the
+   * evidence justified. To re-fit after changing any weight above, re-run qa/confidence.ts.
+   */
+  CAL_A: 0.5163,
+  CAL_B: 0.1358,
+
+  /**
+   * Per-hop retention for inherited links, in probability space.
+   *
+   * NOT fitted, unlike CAL_A/CAL_B, and the distinction matters. The verbatim judge is
+   * structurally unfair to an inherited link: a בא"ד line inherits precisely BECAUSE it
+   * carries no quotation of its own, so it fails a "does the quote reappear" test even when
+   * the link is perfectly correct. Measured at 21%/30%/35% for depths 1/2/3, those figures are
+   * a floor on correctness, not an estimate of it, and calibrating to them would be reading a
+   * broken instrument.
+   *
+   * So this is a reasoned prior: an inherited link is its parent's claim, weakened once per
+   * hop by the chance that the reuse itself is wrong. 0.80 puts a first-hop inheritance from a
+   * 90% parent at 72% — near the flat 75% the old model gave EVERY inherited link — while
+   * finally separating a שם directly under a certain link from one six hops down a shaky
+   * chain, which is the part that was actually broken.
+   */
+  INHERIT_RETENTION: 0.80,
+  /** Confidence assumed for an inherited link whose parent's confidence is unknown. */
+  INHERIT_FALLBACK: 70,
+  MIN: 5,
+  MAX: 99
+} as const;
+
+const clamp01 = (v: number): number => (v < 0 ? 0 : v > 1 ? 1 : v);
+const logistic = (z: number): number => 1 / (1 + Math.exp(-z));
+
+export interface ConfidenceInputs {
+  /** Link reuses a previous link's target (שם / בא"ד / cross-reference fallback). */
+  isInherited?: boolean;
+  /** Hops from the nearest link that was matched on its own evidence. 1 = direct parent. */
+  inheritDepth?: number;
+  /** Confidence of the link being inherited from, if known. */
+  inheritedFrom?: number;
+  /** The commentary line named its target explicitly (ד"ה / בד"ה / גמ'). */
+  isExplicit?: boolean;
+  /** Which flexibility-ladder rung produced the match, if any. */
+  retryRung?: RetryRung | null;
+  evidence?: MatchEvidence | null;
+}
+
+/**
+ * Calculates the displayed confidence (0-100%) for a generated link.
+ * See the model note above. Continuous by construction — no tiers, no hard caps.
+ */
+export function calculateLinkConfidence(inp: ConfidenceInputs): number {
+  const clampPercent = (p: number): number =>
+    Math.max(CONF.MIN, Math.min(CONF.MAX, Math.round(100 * p)));
+  /** Raw model log-odds → calibrated percentage. */
+  const toPercent = (z: number): number =>
+    clampPercent(logistic(CONF.CAL_A * z + CONF.CAL_B));
+
+  if (inp.isInherited) {
+    // An inherited link asserts its parent's claim, discounted once per hop by the chance
+    // that reusing the target is itself wrong. Both terms are already probabilities, so this
+    // is a plain product — it must not go through the Platt scaling above, which is defined
+    // on the evidence model's raw log-odds and would double-apply here.
+    const parent = inp.inheritedFrom && inp.inheritedFrom > 0 ? inp.inheritedFrom : CONF.INHERIT_FALLBACK;
+    const depth = Math.max(1, inp.inheritDepth ?? 1);
+    return clampPercent((parent / 100) * Math.pow(CONF.INHERIT_RETENTION, depth));
   }
 
-  // Short-match confidence dampening: based on matchedWordCount — how many words were
-  // ACTUALLY found matching contiguously during the search — not on DH/line length.
-  // A short line can hold a long, well-matched citation, and a long line can yield only
-  // a couple of genuinely matched words; matchedWordCount reflects the real evidence found,
-  // so cap confidence when it's very low, forcing 'pending' for human review.
-  const SHORT_MATCH_WORD_THRESHOLD = 2;
-  const SHORT_MATCH_CONFIDENCE_CAP = 70;
-  const isShortMatch = matchedWordCount !== undefined && matchedWordCount > 0 && matchedWordCount <= SHORT_MATCH_WORD_THRESHOLD;
-
-  const denominator = expectedWeight && expectedWeight > 0 ? expectedWeight : wordLength;
-  if (isExplicit && matchScore >= denominator + 3) {
-    // Explicit dibur hamatchil exact delimiter match
-    return applyRetryCap(isShortMatch ? SHORT_MATCH_CONFIDENCE_CAP : 98);
+  const ev = inp.evidence;
+  if (!ev || ev.runWords <= 0 || ev.windowWeight <= 0) {
+    // No usable evidence was recorded — report the model's neutral point rather than
+    // inventing a number the signals cannot support.
+    return toPercent(CONF.B0 - (inp.retryRung ? CONF.RUNG_PENALTY[inp.retryRung] : 0));
   }
-  if (denominator <= 0) return applyRetryCap(70);
 
-  const ratio = matchScore / denominator;
-  let confidence: number;
-  if (ratio >= 0.90) confidence = 96;
-  else if (ratio >= 0.75) confidence = 88;
-  else if (ratio >= 0.55) confidence = 76;
-  else confidence = 60;
+  const coverage = clamp01(ev.matchedWeight / ev.windowWeight);
+  const runF = 1 - Math.exp(-ev.runWords / CONF.RUN_SCALE);
+  const meanSim = clamp01(ev.simSum / ev.runWords);
+  const info = clamp01(ev.matchedWeight / ev.runWords / CONF.MAX_WORD_WEIGHT);
+  const margin = ev.winnerScore > 0
+    ? clamp01((ev.winnerScore - ev.runnerUpScore) / ev.winnerScore)
+    : 0;
 
-  confidence = isShortMatch ? Math.min(confidence, SHORT_MATCH_CONFIDENCE_CAP) : confidence;
-  return applyRetryCap(confidence);
+  let z = CONF.B0
+    + CONF.W_COVERAGE * (coverage - CONF.C_COVERAGE)
+    + CONF.W_RUN * (runF - CONF.C_RUN)
+    + CONF.W_SIM * (meanSim - CONF.C_SIM)
+    + CONF.W_INFO * (info - CONF.C_INFO)
+    + CONF.W_MARGIN * (margin - CONF.C_MARGIN);
+
+  if (ev.exactPhrase) z += CONF.W_EXACT;
+  if (inp.isExplicit) z += CONF.W_EXPLICIT;
+  if (inp.retryRung) z -= CONF.RUNG_PENALTY[inp.retryRung];
+
+  return toPercent(z);
 }
 
 /**
@@ -500,6 +662,73 @@ export function stripSecondaryPrefix(line: string): string {
   return cleaned.trim();
 }
 
+/**
+ * Whether a line is a bare source label — it names רש"י / תוספות and has nothing left of its own
+ * once that name is stripped ("פרש"י" on a line by itself, with no ד"ה and no text).
+ *
+ * runLinkingParser skips such a line outright (`explicitSecondaryTarget && !lineForDh.trim()`),
+ * which means it gets no link AND does not sever the inheritance chain — the chain runs straight
+ * through it, like a blank line. The editor's chain (src/utils/inheritanceChain.ts) has to skip
+ * it for the same reason, or it would read the parser's own output as a broken chain.
+ *
+ * Only the keyword branch of the parser's test is reproduced here: the other branch ("שם ד"ה"
+ * routed to whichever secondary source was active) depends on parser state that no line can
+ * carry on its own. A bare "שם" or "גמרא" is deliberately NOT a bare label — the parser searches
+ * those lines and severs the chain when the search fails.
+ */
+export function isBareSourceLabelLine(line: string): boolean {
+  if (!line || !line.trim()) return false;
+
+  // Same three steps as the keyword test in runLinkingParser: normalise, strip the pointer
+  // tokens in front of the source name, then test the source names themselves.
+  const normalized = normalizeText(line.trim(), false);
+  const cleanedPrefix = normalized
+    .replace(LEADING_BULLET_STRIP_RE, '')
+    .replace(BARE_SHAM_STRIP_RE, '')
+    .trim();
+  const lineForKeywordCheck = stripLeadingMarkers(cleanedPrefix) || cleanedPrefix || normalized;
+
+  const namesSecondary = RASHI_KEYWORDS_NORM.some(kw => lineForKeywordCheck.startsWith(kw))
+    || TOSAFOT_KEYWORDS_NORM.some(kw => lineForKeywordCheck.startsWith(kw));
+
+  return namesSecondary && !stripSecondaryPrefix(line.trim()).trim();
+}
+
+/**
+ * The "ibid" idiom (בא"ד / א"ד and spelling variants, optionally preceded by "שם") that states
+ * in the line's own text that it continues the line above it. Deliberately excludes ד"ה / בד"ה:
+ * those name a Dibur Hamatchil of their own and are searched, not inherited.
+ *
+ * Single definition for the whole codebase — the parser reads it per line, and the editor's
+ * inheritance chain (src/utils/inheritanceChain.ts) reproduces the parser's chain from it.
+ */
+const BAAD_CONTINUATION_RE = /^(?:שם\s+)?(?:או"ד|באו"ד|א"ד|בא"ד|אד|באד|אוד|באוד)(?:\s|$|[:.\-])/i;
+
+/** Whether a commentary line opens with the explicit בא"ד/א"ד continuation idiom. */
+export function isBaadContinuationLine(line: string): boolean {
+  if (!line || !line.trim()) return false;
+  return BAAD_CONTINUATION_RE.test(normalizeText(line.trim(), false));
+}
+
+/**
+ * Whether the first content line at or after `fromLineIdx1` (blank lines and headers skipped)
+ * opens with בא"ד — i.e. whether inheritance carries over the header(s) at that point.
+ *
+ * A header normally re-initialises the inheritance chain, but a בא"ד line states in its own text
+ * that it continues the line above it, and that statement holds across a header just as it holds
+ * inside a segment: when it is the first thing a segment says, the previous segment's context is
+ * what it continues. Headers are skipped in the scan so an empty segment (header immediately
+ * followed by another header) does not hide the בא"ד line behind it.
+ */
+export function firstContentLineIsBaad(lines: string[], fromLineIdx1: number): boolean {
+  for (let i = Math.max(1, fromLineIdx1); i <= lines.length; i++) {
+    const raw = lines[i - 1] ?? '';
+    if (!raw.trim() || isHeaderLine(raw)) continue;
+    return isBaadContinuationLine(raw);
+  }
+  return false;
+}
+
 export interface HeaderSegment {
   headerTitle: string;
   headerLineIndex: number; // 1-based physical line index
@@ -710,6 +939,19 @@ export function runLinkingParser(
   const rashiLineCache = rashiDoc ? buildLineCache(rashiDoc.lines) : undefined;
   const tosafotLineCache = tosafotDoc ? buildLineCache(tosafotDoc.lines) : undefined;
 
+  /**
+   * What both search functions return. `evidence` is display-only: it records how the winner
+   * was found so calculateLinkConfidence can describe it, and nothing reads it back.
+   */
+  interface SearchResult {
+    lineNum: number | null;
+    matchedCount: number;
+    matchedWordCount: number;
+    expectedWeight: number;
+    topK: { lineNum: number; score: number }[];
+    evidence: MatchEvidence;
+  }
+
   // First Anchor Priority search for primary sources containing כו' / וכו'.
   const searchPrimaryWithFirstAnchor = (
     docLines: string[],
@@ -722,9 +964,9 @@ export function runLinkingParser(
     lineCache?: LineCacheEntry[],
     maxDhWords: number = 12,
     excludeLines?: Set<number>
-  ): { lineNum: number | null; matchedCount: number; matchedWordCount: number; expectedWeight: number; topK: {lineNum: number; score: number}[] } => {
+  ): SearchResult => {
     if (!docLines || docLines.length === 0) {
-      return { lineNum: null, matchedCount: 0, matchedWordCount: 0, expectedWeight: 0, topK: [] };
+      return { lineNum: null, matchedCount: 0, matchedWordCount: 0, expectedWeight: 0, topK: [], evidence: EMPTY_EVIDENCE };
     }
 
     const validStart = Math.max(1, Math.min(start, docLines.length));
@@ -807,10 +1049,25 @@ export function runLinkingParser(
     const fullWords = normalizeText(fullLineText).split(/\s+/).filter(Boolean);
     const expectedWeight = fullWords.reduce((sum, w) => sum + getCombinedWordWeight(w, enableWordWeighting, idfMap), 0);
 
+    // Per-segment weights, for the confidence denominator only. This path's ranking score
+    // carries anchor multipliers (×2.5 / ×1.2 / ×1.0) that put it on its own scale, so
+    // coverage is measured against the raw segment weights the scorers could actually earn.
+    const segExpectedWeight = (words: string[]) =>
+      words.reduce((sum, w) => sum + getCombinedWordWeight(w, enableWordWeighting, idfMap), 0);
+    const seg2ExpectedWeight = segExpectedWeight(seg2Words);
+    const seg3ExpectedWeight = segExpectedWeight(seg3Words);
+
     let bestLine: number | null = null;
     let maxScore = -Infinity;
     let bestMatchedCount = 0;
     let bestMatchedWordCount = 0;
+    // Runner-up ranking score, for the discriminative margin.
+    let secondScore = -Infinity;
+    // Raw (pre-multiplier) segment scores of the winning line, plus whether segment 1 —
+    // the actual quotation — was found verbatim.
+    let bestRawMatched = 0;
+    let bestRawWindow = 0;
+    let bestSeg1Exact = false;
 
     /**
      * Scorer for a CONTINUATION fragment — the words after a כו'.
@@ -925,9 +1182,12 @@ export function runLinkingParser(
       let seqScore = score1 * 2.5; // Anchor Weight bonus for First Anchor
       let foundSeq2 = !seg2Words.length;
       let foundSeq3 = !seg3Words.length;
+      // Hoisted out of the two blocks below so the winner-recording step can read them as
+      // confidence evidence. Same values, same assignments — only the scope changed.
+      let bestSeg2Score = 0;
+      let bestSeg3Score = 0;
 
       if (seg2Words.length > 0) {
-        let bestSeg2Score = 0;
         for (let nextL = lNum; nextL <= Math.min(docLines.length, lNum + 10); nextL++) {
           const nextRaw = docLines[nextL - 1];
           if (!nextRaw) continue;
@@ -952,7 +1212,6 @@ export function runLinkingParser(
       }
 
       if (seg3Words.length > 0 && foundSeq2) {
-        let bestSeg3Score = 0;
         for (let nextL = lNum; nextL <= Math.min(docLines.length, lNum + 15); nextL++) {
           const nextRaw = docLines[nextL - 1];
           if (!nextRaw) continue;
@@ -988,6 +1247,7 @@ export function runLinkingParser(
       const finalCandidateScore = seqScore - distPenalty;
 
       if (finalCandidateScore > maxScore) {
+        secondScore = maxScore;
         maxScore = finalCandidateScore;
         bestLine = lNum;
         // Use the full combined (post-penalty) score, not just segment 1's raw score, so
@@ -997,11 +1257,41 @@ export function runLinkingParser(
         bestMatchedWordCount = seg1Words.length
           + (foundSeq2 ? seg2Words.length : 0)
           + (foundSeq3 ? seg3Words.length : 0);
+        // Evidence: raw segment scores against the raw segment weights. A continuation that
+        // was not found contributes to neither side — an unfound seg2 is usually the
+        // commentator's own essay rather than a missed quotation (see the BUG-06 note above),
+        // so charging its weight to the denominator would punish sound links.
+        bestRawMatched = score1 + (foundSeq2 ? bestSeg2Score : 0) + (foundSeq3 ? bestSeg3Score : 0);
+        bestRawWindow = seg1ExpectedWeight
+          + (foundSeq2 ? seg2ExpectedWeight : 0)
+          + (foundSeq3 ? seg3ExpectedWeight : 0);
+        bestSeg1Exact = docLineNorm.includes(seg1Words.join(' '));
+      } else if (finalCandidateScore > secondScore) {
+        secondScore = finalCandidateScore;
       }
     }
 
     if (bestLine !== null) {
-      return { lineNum: bestLine, matchedCount: bestMatchedCount, matchedWordCount: bestMatchedWordCount, expectedWeight, topK: [{ lineNum: bestLine, score: bestMatchedCount }] };
+      return {
+        lineNum: bestLine,
+        matchedCount: bestMatchedCount,
+        matchedWordCount: bestMatchedWordCount,
+        expectedWeight,
+        topK: [{ lineNum: bestLine, score: bestMatchedCount }],
+        evidence: {
+          matchedWeight: bestRawMatched,
+          windowWeight: bestRawWindow,
+          runWords: bestMatchedWordCount,
+          // This path scores segments as bags/runs and never retains per-word similarities.
+          // Reporting the run as fully exact would overstate it, so mean similarity is set to
+          // the stem-match level (0.92) — the model's near-neutral point — which leaves the
+          // verdict to coverage, run length, margin and the verbatim flag.
+          simSum: bestMatchedWordCount * 0.92,
+          winnerScore: bestMatchedCount,
+          runnerUpScore: secondScore > 0 ? secondScore : 0,
+          exactPhrase: bestSeg1Exact
+        }
+      };
     }
 
     const cleanDh = normalizeText(fullLineText);
@@ -1023,10 +1313,10 @@ export function runLinkingParser(
     maxDhWords: number = 12,
     thresholdMultiplier: number = 0.65,
     excludeLines?: Set<number>
-  ): { lineNum: number | null; matchedCount: number; matchedWordCount: number; expectedWeight: number; topK: {lineNum: number; score: number}[] } => {
+  ): SearchResult => {
     if (!docLines || docLines.length === 0) {
       if (DEBUG) console.log(`    ⚠️ searchLineInDoc: docLines is empty!`);
-      return { lineNum: null, matchedCount: 0, matchedWordCount: 0, expectedWeight: 0, topK: [] };
+      return { lineNum: null, matchedCount: 0, matchedWordCount: 0, expectedWeight: 0, topK: [], evidence: EMPTY_EVIDENCE };
     }
 
     const validStart = Math.max(1, Math.min(start, docLines.length));
@@ -1041,6 +1331,14 @@ export function runLinkingParser(
       (sum, w) => sum + getCombinedWordWeight(w, enableWordWeighting, idfMap),
       0
     );
+
+    // Confidence denominator (display-only, see the model note above calculateLinkConfidence).
+    // Deliberately NOT expectedWeight: calcContiguousScore caps its source at maxDhWords, so
+    // words past that cap can never contribute to the numerator and counting them here is what
+    // made the old ratio unreachable. This is the weight of exactly what the matcher may see.
+    const windowWeight = wordsForWeight
+      .slice(0, maxDhWords)
+      .reduce((sum, w) => sum + getCombinedWordWeight(w, enableWordWeighting, idfMap), 0);
 
     if (DEBUG) console.log(`    📊 searchLineInDoc: validStart=${validStart}, validEnd=${validEnd}, prevLineNum=${prevLineNum ?? 'none'}, searchWords=[${searchWords.join(',')}], fullWords=[${fullWords.join(',')}], isExplicit=${isExplicit}, expectedWeight=${expectedWeight.toFixed(2)}, requireStartAtFirstWord=${requireStartAtFirstWord}`);
 
@@ -1078,7 +1376,7 @@ export function runLinkingParser(
       return false;
     };
 
-    const calcContiguousScore = (sourceWords: string[], targetWords: string[]): { score: number; wordCount: number } => {
+    const calcContiguousScore = (sourceWords: string[], targetWords: string[]): { score: number; wordCount: number; simSum: number } => {
       // COMMENTARY SIDE — unchanged. A match must still begin within the first 3 words of
       // the commentary line; nothing in the BUG-02 anchor fix touches this.
       const maxStartIdx = Math.min(3, sourceWords.length);
@@ -1100,10 +1398,15 @@ export function runLinkingParser(
 
       let maxSeqScore = 0;
       let bestWordCount = 0;
+      // Unweighted similarity total of the winning run. Carried alongside the weighted score
+      // purely as confidence evidence (mean exactness); it takes no part in the comparison
+      // that picks the run, so the run chosen here is the same one as before.
+      let bestSimSum = 0;
       for (let startWIdx = 0; startWIdx < maxStartIdx; startWIdx++) {
         for (let docWIdx = 0; docWIdx < maxDocWIdx; docWIdx++) {
           let k = 0;
           let seqScore = 0;
+          let simSum = 0;
           while (
             startWIdx + k < cappedSource.length &&
             docWIdx + k < targetWords.length
@@ -1113,6 +1416,7 @@ export function runLinkingParser(
             const sim = getWordSimilarity(w1, w2, enableFuzzy);
             if (sim <= 0) break;
             seqScore += sim * sourceWeights[startWIdx + k];
+            simSum += sim;
             k++;
           }
           // A deep anchor has to earn its position with a genuine contiguous run; a shallow
@@ -1122,10 +1426,11 @@ export function runLinkingParser(
           if (seqScore > maxSeqScore) {
             maxSeqScore = seqScore;
             bestWordCount = k;
+            bestSimSum = simSum;
           }
         }
       }
-      return { score: maxSeqScore, wordCount: bestWordCount };
+      return { score: maxSeqScore, wordCount: bestWordCount, simSum: bestSimSum };
     };
 
     // Perf (behavior-neutral): searchFp only depends on fullLineText, which is fixed for the
@@ -1150,7 +1455,7 @@ export function runLinkingParser(
       expSource: string[],
       target: string[],
       expTarget: string[]
-    ): { score: number; wordCount: number } => {
+    ): { score: number; wordCount: number; simSum: number } => {
       const sourceChanged = expSource !== source;
       const targetChanged = expTarget !== target;
 
@@ -1213,6 +1518,11 @@ export function runLinkingParser(
 
       let bestLineFpDist = Infinity; // fingerprint distance of current bestLine
 
+      // Confidence evidence for whichever line ends up as bestLine (display-only).
+      let bestSimSum = 0;
+      let bestMatchedWeight = 0;
+      let bestExactPhrase = false;
+
       // Top-K collection: keeps the best 3 candidates sorted by score descending.
       // Each entry: { lineNum, score, fpDist, dist }
       const TOP_K = 3;
@@ -1262,6 +1572,11 @@ export function runLinkingParser(
 
         let currentMatchCount = 0;
         let currentWordCount = 0;
+        // Per-candidate confidence evidence. Written but never read by any acceptance or
+        // ranking test below — it only rides along to the winner.
+        let currentSimSum = 0;
+        let currentMatchedWeight = 0;
+        let currentExactPhrase = false;
 
         if (isExplicit) {
           // Explicit delimiter / כו': search for searchPhrase or expSearchPhrase in docLineNorm / expDocLineNorm
@@ -1273,11 +1588,17 @@ export function runLinkingParser(
             // Perfect exact substring match gets maximum bonus based on expectedWeight
             currentMatchCount = expectedWeight + 10;
             currentWordCount = searchWords.length;
+            // Verbatim occurrence: full coverage of the window, every word an exact hit.
+            currentExactPhrase = true;
+            currentMatchedWeight = windowWeight;
+            currentSimSum = currentWordCount;
           } else {
             // Word-by-word matching with fuzzy similarity score and word weighting
             const winningRes = bestOfCombos(searchWords, expSearchWords, docWords, expDocWords);
             currentMatchCount = winningRes.score;
             currentWordCount = winningRes.wordCount;
+            currentMatchedWeight = winningRes.score;
+            currentSimSum = winningRes.simSum;
           }
         } else {
           // No explicit delimiter: find longest contiguous sequence of matching words.
@@ -1287,6 +1608,10 @@ export function runLinkingParser(
           const winningRes = bestOfCombos(fullWords, expFullWords, docWords, expDocWords);
           let rawMatchCount = winningRes.score;
           currentWordCount = winningRes.wordCount;
+          // Evidence uses the pre-penalty score: the sequential-distance factor below is a
+          // ranking nudge between candidates, not a statement about how well the text matched.
+          currentMatchedWeight = winningRes.score;
+          currentSimSum = winningRes.simSum;
 
           // Apply Sequential Monotonicity Penalty if prevLineNum is available
           // Note: Very subtle bias (max 5% - 7%) so that out-of-order commentaries are not penalized
@@ -1329,12 +1654,21 @@ export function runLinkingParser(
             ? levenshteinDistance(searchFp, candidateFp)
             : Infinity;
 
+          // Evidence follows the winner. Assigned in the same three places as
+          // bestMatchedWordCount and never tested, so the winner itself is unchanged.
+          const takeEvidence = () => {
+            bestSimSum = currentSimSum;
+            bestMatchedWeight = currentMatchedWeight;
+            bestExactPhrase = currentExactPhrase;
+          };
+
           if (currentMatchCount > maxMatchedCount) {
             maxMatchedCount = currentMatchCount;
             bestMatchedWordCount = currentWordCount;
             bestLine = lNum;
             minDistance = dist;
             bestLineFpDist = fpDist;
+            takeEvidence();
           } else if (currentMatchCount === maxMatchedCount) {
             // Primary tie-break: closer position
             if (dist < minDistance) {
@@ -1342,11 +1676,13 @@ export function runLinkingParser(
               bestMatchedWordCount = currentWordCount;
               minDistance = dist;
               bestLineFpDist = fpDist;
+              takeEvidence();
             } else if (dist === minDistance && fpDist < bestLineFpDist) {
               // Secondary tie-break: better nikud fingerprint match
               bestLine = lNum;
               bestMatchedWordCount = currentWordCount;
               bestLineFpDist = fpDist;
+              takeEvidence();
             }
           }
 
@@ -1370,11 +1706,29 @@ export function runLinkingParser(
 
       if (DEBUG) console.log(`    ✓ searchLineInDoc checked ${linesChecked} lines, bestLine=${bestLine}, maxMatchedCount=${maxMatchedCount}`);
       if (bestLine !== null) {
-        return { lineNum: bestLine, matchedCount: maxMatchedCount, matchedWordCount: bestMatchedWordCount, expectedWeight, topK: topCandidates.map(c => ({ lineNum: c.lineNum, score: c.score })) };
+        // The runner-up is the best RIVAL — the top-K list is score-ordered and its head is
+        // the winner itself, so the discriminative margin is measured against entry 1.
+        const runnerUp = topCandidates.find(c => c.lineNum !== bestLine);
+        return {
+          lineNum: bestLine,
+          matchedCount: maxMatchedCount,
+          matchedWordCount: bestMatchedWordCount,
+          expectedWeight,
+          topK: topCandidates.map(c => ({ lineNum: c.lineNum, score: c.score })),
+          evidence: {
+            matchedWeight: bestMatchedWeight,
+            windowWeight,
+            runWords: bestMatchedWordCount,
+            simSum: bestSimSum,
+            winnerScore: maxMatchedCount,
+            runnerUpScore: runnerUp ? runnerUp.score : 0,
+            exactPhrase: bestExactPhrase
+          }
+        };
       }
     }
 
-    return { lineNum: null, matchedCount: 0, matchedWordCount: 0, expectedWeight: 0, topK: [] };
+    return { lineNum: null, matchedCount: 0, matchedWordCount: 0, expectedWeight: 0, topK: [], evidence: EMPTY_EVIDENCE };
   };
 
   // ─── Explicit-Reference Flexibility Ladder ("סולם הגמשה") ─────────────────
@@ -1407,7 +1761,7 @@ export function runLinkingParser(
     lineCache: LineCacheEntry[] | undefined,
     maxDhWords: number,
     excludeLines?: Set<number>
-  ): { result: { lineNum: number | null; matchedCount: number; matchedWordCount: number; expectedWeight: number; topK: {lineNum: number; score: number}[] }; rung: RetryRung } | null => {
+  ): { result: SearchResult; rung: RetryRung } | null => {
     // Rung A: requireStartAtFirstWord = false
     let res = searchLineInDoc(docLines, segStart, segEnd, cleanDhText, fullLineText, isExplicit, idfMap, prevLineNum, false, lineCache, maxDhWords, 0.65, excludeLines);
     if (res.lineNum) return { result: res, rung: 'A' };
@@ -1442,8 +1796,23 @@ export function runLinkingParser(
   // Map source header segments to commentary header segments
   let previousSecondaryType: 'rashi' | 'tosafot' | null = null;
 
+  // The inheritance context a segment leaves behind: the last link of the last segment that had
+  // any content lines, and its inheritance depth. A segment normally starts from scratch, but a
+  // segment whose first content line says בא"ד continues that context across the header — see
+  // firstContentLineIsBaad. Carried over only from segments that actually held content, so an
+  // empty segment in between does not sever the chain.
+  let carriedLink: OtzariaLink | null = null;
+  let carriedInheritDepth = 0;
+
   commDoc.segments.forEach(commSeg => {
-    let previousLink: OtzariaLink | null = null;
+    const opensWithBaad = firstContentLineIsBaad(commDoc.lines, commSeg.startLine);
+    let previousLink: OtzariaLink | null = opensWithBaad ? carriedLink : null;
+    // How many inheritance hops separate previousLink from the last link that was matched on
+    // its own textual evidence (0 = previousLink was matched directly). Confidence decays once
+    // per hop instead of reporting a flat 75 for the whole chain — display-only, and it does
+    // not participate in any inheritance decision.
+    let previousInheritDepth = opensWithBaad ? carriedInheritDepth : 0;
+    let segmentHadContent = false;
 
     // Explicit-reference dedup guard (per commentary segment): tracks which secondary-
     // source lines (Rashi / Tosafot) have already been claimed by an explicit ד"ה/בד"ה
@@ -1462,6 +1831,7 @@ export function runLinkingParser(
       if (cLineIdx > commDoc.lines.length) break;
       const cLineRaw = commDoc.lines[cLineIdx - 1];
       if (!cLineRaw || isHeaderLine(cLineRaw) || !cLineRaw.trim()) continue;
+      segmentHadContent = true;
 
       const trimmedLine = cLineRaw.trim();
       // Normalize the prefix line fully for keyword matching (includes nikud removal, quote normalization)
@@ -1531,8 +1901,7 @@ export function runLinkingParser(
         }
       }
 
-      const isBaadRegex = /^(?:שם\s+)?(?:או"ד|באו"ד|א"ד|בא"ד|אד|באד|אוד|באוד)(?:\s|$|[:.\-])/i;
-      const isBaad = Boolean(normalizedPrefixLine.match(isBaadRegex));
+      const isBaad = isBaadContinuationLine(trimmedLine);
       const isJustSham = normalizedPrefixLine.startsWith('שם') && !normalizedPrefixLine.match(/^שם\s+(?:ד"ה|דה|בד"ה|בדה)(?:\s|$|[:.\-])/i);
 
       // Handle Inheritance ("שם" - Step 5)
@@ -1552,6 +1921,9 @@ export function runLinkingParser(
       // For secondary target explicit lines, if stripSecondaryPrefix returns empty, skip this line
       if (explicitSecondaryTarget && !lineForDh.trim()) {
         if (DEBUG) console.log(`  ⏭️  SKIP: explicit secondary but no DH text`);
+        // Note: skipped BEFORE the link / no-link decision below, so such a line neither takes a
+        // link nor severs the inheritance chain. `isBareSourceLabelLine` is the same test in
+        // predicate form, for the editor's copy of the chain.
         continue; // No DH text after removing secondary prefix - skip this commentary line
       }
       // For non-explicit lines, use lineForDh or fallback to trimmedLine
@@ -1569,8 +1941,8 @@ export function runLinkingParser(
       let secondaryRetryRung: RetryRung | null = null;
       let primaryRetryRung: RetryRung | null = null;
 
-      let srcMatchRes = { lineNum: null as number | null, matchedCount: 0, matchedWordCount: 0, expectedWeight: 0, topK: [] as {lineNum: number; score: number}[] };
-      let secMatchRes = { lineNum: null as number | null, matchedCount: 0, matchedWordCount: 0, expectedWeight: 0, topK: [] as {lineNum: number; score: number}[] };
+      let srcMatchRes: SearchResult = { lineNum: null, matchedCount: 0, matchedWordCount: 0, expectedWeight: 0, topK: [], evidence: EMPTY_EVIDENCE };
+      let secMatchRes: SearchResult = { lineNum: null, matchedCount: 0, matchedWordCount: 0, expectedWeight: 0, topK: [], evidence: EMPTY_EVIDENCE };
 
       // Bug #1 FIX: Calculate separate "previous line index" for secondary sources.
       // We only want to use the previous line of the SAME secondary document (e.g. Rashi vs Rashi).
@@ -1860,23 +2232,69 @@ export function runLinkingParser(
         const headerTitle = isSecondaryLink
           ? (targetSecondary === 'rashi' ? rashiSeg?.headerTitle : tosafotSeg?.headerTitle) || config.targetBookName
           : srcSeg ? srcSeg.headerTitle : config.targetBookName;
-        const heRef = isSecondaryLink
-          ? `${getSecondaryBookLabel(targetSecondary!)} - ${headerTitle}`
-          : `${config.targetBookName} - ${headerTitle}`;
-        const path_2 = isSecondaryLink
-          ? getSecondaryPath(targetSecondary!, config.targetBookName)
-          : `${config.targetBookName}.txt`;
 
-        const matchScore = Math.max(srcMatchRes.matchedCount, secMatchRes.matchedCount);
-        const expWeight = Math.max(srcMatchRes.expectedWeight, secMatchRes.expectedWeight);
-        const wordLength = (cleanDh || lineForDhExtraction).split(/\s+/).filter(Boolean).length;
-        const matchedWordCountForConfidence = Math.max(srcMatchRes.matchedWordCount, secMatchRes.matchedWordCount);
+        // A line that took its target wholesale from the previous link points at a line in
+        // whichever segment that target lives in — this segment's matching source segment in the
+        // ordinary case, but the PREVIOUS one when the chain crossed a header (a segment opening
+        // with בא"ד). The reference must describe the target line, so it is copied along with the
+        // target instead of being recomputed from this segment's header: inside a segment the two
+        // produce the same string, across a header they differ by a whole daf.
+        const prevForRef = previousLink;
+        const inheritsReference = Boolean(
+          isInherited && prevForRef &&
+          matchedSourceLineNum === prevForRef.line_index_2 &&
+          (targetSecondary || null) === (prevForRef.secondaryTarget || null) &&
+          (matchedSecondaryLineNum || null) === (prevForRef.secondary_line_index || null)
+        );
+
+        const heRef = (inheritsReference && prevForRef)
+          ? prevForRef.heRef_2
+          : isSecondaryLink
+            ? `${getSecondaryBookLabel(targetSecondary!)} - ${headerTitle}`
+            : `${config.targetBookName} - ${headerTitle}`;
+        const path_2 = (inheritsReference && prevForRef)
+          ? prevForRef.path_2
+          : isSecondaryLink
+            ? getSecondaryPath(targetSecondary!, config.targetBookName)
+            : `${config.targetBookName}.txt`;
+        const secondaryRef = !isSecondaryLink
+          ? undefined
+          : (inheritsReference && prevForRef?.secondaryRef)
+            ? prevForRef.secondaryRef
+            : `${getSecondaryBookLabel(targetSecondary!)} (${headerTitle})`;
+
         // Which retry-ladder rung (if any) actually produced this link's match — the
         // secondary-source path's rung if this is a secondary link, otherwise the
         // primary-source path's rung.
         const retryRungForConfidence = isSecondaryLink ? secondaryRetryRung : primaryRetryRung;
-        const confidence = calculateLinkConfidence(Boolean(isInherited), matchScore, wordLength, isExplicitDelimiter, expWeight, matchedWordCountForConfidence, retryRungForConfidence);
-        (globalThis as any).__CONF_DBG?.push({ matchScore, expWeight, wordLength, isExplicit: isExplicitDelimiter, matchedWordCount: matchedWordCountForConfidence, rung: retryRungForConfidence, inherited: Boolean(isInherited), confidence, cLine: cLineIdx, tLine: matchedSourceLineNum, dh: dhText || cleanDh });
+
+        // Evidence comes from the search that actually produced this link, taken as one
+        // coherent object. (The old code took `matchScore` and `expectedWeight` through two
+        // independent Math.max calls, so a ratio could be built from one search's numerator
+        // over the other search's denominator.)
+        const producingRes = isSecondaryLink
+          ? (secMatchRes.lineNum ? secMatchRes : srcMatchRes)
+          : (srcMatchRes.lineNum ? srcMatchRes : secMatchRes);
+
+        const confidence = calculateLinkConfidence({
+          isInherited: Boolean(isInherited),
+          inheritDepth: previousInheritDepth + 1,
+          inheritedFrom: previousLink?.confidence,
+          isExplicit: isExplicitDelimiter,
+          retryRung: retryRungForConfidence,
+          evidence: producingRes.evidence
+        });
+        // Calibration tap. Inert unless a harness has installed the sink — the optional call
+        // costs one property read per link and the array does not exist in the app. It is the
+        // only way qa/confidence.ts can see the per-link evidence behind a percentage, which
+        // is what the reliability report and the Platt re-fit are computed from. Writes
+        // nothing to the link and is never read back by the parser. See CONF.CAL_A/CAL_B.
+        (globalThis as any).__CONF_TAP?.push({
+          ev: producingRes.evidence, isExplicit: isExplicitDelimiter, rung: retryRungForConfidence,
+          inherited: Boolean(isInherited), depth: previousInheritDepth + 1, parent: previousLink?.confidence,
+          confidence, cLine: cLineIdx, tLine: matchedSourceLineNum, secLine: matchedSecondaryLineNum,
+          sec: targetSecondary, dh: dhText || cleanDh
+        });
         const status: 'approved' | 'pending' = confidence >= 85 ? 'approved' : 'pending';
 
         // Build Top-K candidates list from whichever source produced the match.
@@ -1887,10 +2305,42 @@ export function runLinkingParser(
             ? srcMatchRes.topK
             : secMatchRes.topK;
 
-        const linkCandidates: import('../types').LinkCandidate[] = rawTopK.map(c => ({
+        // Each candidate is scored as if it were the chosen one, so the dropdown ranks the
+        // alternatives instead of repeating one number three times (which is what it did
+        // before: every candidate of every multi-candidate link shared an identical value).
+        //
+        // Only the winner's evidence was measured in full, so a rival's is derived from it by
+        // the ratio of their ranking scores — the quantity that separated them in the first
+        // place — holding mean per-word exactness fixed and re-deriving each candidate's own
+        // margin against its own best rival. Approximate in magnitude, faithful in ordering.
+        const winnerEv = producingRes.evidence;
+        const candidateEvidence = (score: number, rivalBest: number): MatchEvidence => {
+          const ratio = winnerEv.winnerScore > 0 ? Math.max(0, score / winnerEv.winnerScore) : 1;
+          const meanSim = winnerEv.runWords > 0 ? winnerEv.simSum / winnerEv.runWords : 0;
+          const runWords = Math.max(1, Math.round(winnerEv.runWords * ratio));
+          return {
+            matchedWeight: winnerEv.matchedWeight * ratio,
+            windowWeight: winnerEv.windowWeight,
+            runWords,
+            simSum: meanSim * runWords,
+            winnerScore: score,
+            runnerUpScore: rivalBest,
+            // The verbatim flag was established for the winning line only.
+            exactPhrase: winnerEv.exactPhrase && score >= winnerEv.winnerScore
+          };
+        };
+
+        const linkCandidates: import('../types').LinkCandidate[] = rawTopK.map((c, i) => ({
           lineNum: c.lineNum,
           score: c.score,
-          confidence: calculateLinkConfidence(false, c.score, wordLength, isExplicitDelimiter, expWeight, matchedWordCountForConfidence)
+          confidence: calculateLinkConfidence({
+            isExplicit: isExplicitDelimiter,
+            retryRung: retryRungForConfidence,
+            evidence: candidateEvidence(
+              c.score,
+              rawTopK.reduce((best, o, j) => (j === i ? best : Math.max(best, o.score)), 0)
+            )
+          })
         }));
 
         const targetDocLines = isSecondaryLink
@@ -1907,7 +2357,7 @@ export function runLinkingParser(
           connection_type: "commentary",
           secondaryTarget: targetSecondary || undefined,
           secondary_line_index: matchedSecondaryLineNum || undefined,
-          secondaryRef: isSecondaryLink ? `${getSecondaryBookLabel(targetSecondary!)} (${headerTitle})` : undefined,
+          secondaryRef,
           isInherited,
           dhText: dhText || cleanDh,
           confidence,
@@ -1919,12 +2369,15 @@ export function runLinkingParser(
 
         links.push(newLink);
         previousLink = newLink;
+        // A link matched on its own evidence restarts the chain; an inherited one extends it.
+        previousInheritDepth = isInherited ? previousInheritDepth + 1 : 0;
         previousSecondaryType = targetSecondary;
       } else {
         // Rule: a content line that ends up with NO link at all breaks the inheritance chain.
         // Without this, a later line (e.g. line 6) could silently inherit a link from an
         // earlier line (e.g. line 4) by skipping over a linkless line (e.g. line 5) in between.
         previousLink = null;
+        previousInheritDepth = 0;
       }
 
       // Calculate initial DH word highlight range (words count)
@@ -1942,6 +2395,14 @@ export function runLinkingParser(
         wordStart: 0,
         wordCount: Math.max(1, Math.min(dhWordCount, wordsInLine.length))
       };
+    }
+
+    // Hand this segment's tail on to the next one, for the case where the next segment opens
+    // with בא"ד. A segment with no content lines of its own has nothing to say about the chain,
+    // so it passes the previous segment's tail through untouched.
+    if (segmentHadContent) {
+      carriedLink = previousLink;
+      carriedInheritDepth = previousInheritDepth;
     }
   });
 

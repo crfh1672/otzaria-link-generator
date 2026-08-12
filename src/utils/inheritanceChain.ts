@@ -1,5 +1,11 @@
 import { DHHighlight, OtzariaLink } from '../types';
-import { findSourceMatchRange, isHeaderLine, normalizeText } from './parserAlgorithm';
+import {
+  findSourceMatchRange,
+  firstContentLineIsBaad,
+  isBaadContinuationLine,
+  isBareSourceLabelLine,
+  isHeaderLine
+} from './parserAlgorithm';
 
 /**
  * Context inheritance ("ירושת הקשר") in the editor.
@@ -9,8 +15,12 @@ import { findSourceMatchRange, isHeaderLine, normalizeText } from './parserAlgor
  * runLinkingParser). Two parser rules define the chain and are reproduced here so a manual
  * re-link in the editor propagates over exactly the lines the parser would have re-derived:
  *   1. A content line that ends up with no link severs the chain (`previousLink = null`).
- *   2. Inheritance never crosses a header — `previousLink` is re-initialised per segment.
- * Blank lines are skipped by the parser without breaking anything, so they are skipped here too.
+ *   2. Inheritance is re-initialised per header segment, EXCEPT when the segment's first content
+ *      line says בא"ד: such a line continues the line above it across the header too, so the
+ *      previous segment's tail is carried in as its context (`firstContentLineIsBaad`).
+ * Blank lines are skipped by the parser without breaking anything, so they are skipped here too —
+ * and so is a bare source label ("פרש"י" alone, `isBareSourceLabelLine`), which the parser skips
+ * before it ever decides link / no link, leaving the chain running through it.
  *
  * Rule 1 has one exception, and it is what a בא"ד line means: such a line states in its own
  * text that it continues the line above it, so it stays attached to that line even when the
@@ -22,26 +32,21 @@ import { findSourceMatchRange, isHeaderLine, normalizeText } from './parserAlgor
  */
 
 /**
- * The "ibid" idiom the parser reads as an explicit order to inherit the previous context
- * (`isBaadRegex` in runLinkingParser — keep the two in sync). Deliberately excludes ד"ה /
- * בד"ה: those name a Dibur Hamatchil of their own and are searched, not inherited.
- */
-const BAAD_MARKER_RE = /^(?:שם\s+)?(?:או"ד|באו"ד|א"ד|בא"ד|אד|באד|אוד|באוד)(?:\s|$|[:.\-])/i;
-
-/**
  * Whether a commentary line opens with an explicit בא"ד/א"ד reference, i.e. states in the text
- * itself that it continues the line above it.
+ * itself that it continues the line above it. The idiom itself is defined once, next to the
+ * parser that reads it (`isBaadContinuationLine`), so the two can never drift apart.
  */
 export function hasExplicitBaadMarker(commentaryLine: string): boolean {
-  if (!commentaryLine || !commentaryLine.trim()) return false;
-  return BAAD_MARKER_RE.test(normalizeText(commentaryLine.trim(), false));
+  return isBaadContinuationLine(commentaryLine);
 }
 
 /**
  * The lines that inherit their context from `parentLineIdx1`, in document order — both the
  * lines that already hold an inherited link and the בא"ד lines still waiting for a target.
- * Walking stops at the first line that owns its target, at a line that found no source and
- * does not say בא"ד, and at a header — everything past that point belongs to a different chain.
+ * Walking stops at the first line that owns its target, at a line that found no source and does
+ * not say בא"ד, and at a header — unless the first content line after that header says בא"ד, in
+ * which case the chain continues into the next segment exactly as the parser continues it.
+ * Everything past the stopping point belongs to a different chain.
  */
 export function collectInheritedFollowers(
   parentLineIdx1: number,
@@ -53,10 +58,20 @@ export function collectInheritedFollowers(
 
   for (let lineIdx1 = parentLineIdx1 + 1; lineIdx1 <= commentaryLines.length; lineIdx1++) {
     const raw = commentaryLines[lineIdx1 - 1] ?? '';
-    if (isHeaderLine(raw)) break;
+    // A header ends the chain unless the segment it opens starts with a בא"ד line, which
+    // continues this chain across it.
+    if (isHeaderLine(raw)) {
+      if (!firstContentLineIsBaad(commentaryLines, lineIdx1 + 1)) break;
+      continue;
+    }
     if (!raw.trim()) continue;
 
     const link = linkByLine.get(lineIdx1);
+    // A bare source label carries no link because the parser never offered it one, not because
+    // the chain ended there — so it is passed over, exactly as the parser passes over it. One the
+    // user linked by hand is an ordinary line that owns its target, and is handled below.
+    if (!link && isBareSourceLabelLine(raw)) continue;
+
     if (link) {
       if (!link.isInherited) break;
     } else if (!hasExplicitBaadMarker(raw)) {
@@ -83,10 +98,20 @@ export function findInheritanceParent(
 
   for (let cursor = lineIdx1 - 1; cursor >= 1; cursor--) {
     const raw = commentaryLines[cursor - 1] ?? '';
-    if (isHeaderLine(raw)) return null;
+    // Symmetrical to collectInheritedFollowers: climbing stops at a header, unless the content
+    // line that opens the segment below it says בא"ד — then the chain runs through the header
+    // and its head is somewhere in the segment above.
+    if (isHeaderLine(raw)) {
+      if (!firstContentLineIsBaad(commentaryLines, cursor + 1)) return null;
+      continue;
+    }
     if (!raw.trim()) continue;
 
     const link = linkByLine.get(cursor);
+    // Passed over for the same reason as in collectInheritedFollowers: the parser skipped it, so
+    // it is neither a head nor a member of the chain.
+    if (!link && isBareSourceLabelLine(raw)) continue;
+
     // A line with a target of its own is the head; one that inherits is another link in the
     // same chain, so keep climbing.
     if (link) {
