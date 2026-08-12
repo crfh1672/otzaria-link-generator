@@ -11,7 +11,7 @@
  */
 
 import { isBareSourceLabelLine, runLinkingParser } from '../src/utils/parserAlgorithm';
-import type { PluginConfig } from '../src/types';
+import type { OtzariaLink, PluginConfig } from '../src/types';
 
 const config = {
   sourceCategory: 'shas',
@@ -37,7 +37,7 @@ const eq = (name: string, actual: unknown, expected: unknown) => {
   console.log(`${a === e ? 'PASS' : 'FAIL'}  ${name}${a === e ? '' : `\n   got ${a}\n   want ${e}`}`);
 };
 
-const linkOf = (links: { line_index_1: number }[], line: number) =>
+const linkOf = (links: OtzariaLink[], line: number) =>
   links.find(l => l.line_index_1 === line);
 
 /* ── 1. the new segment opens with בא"ד → it continues the previous segment ─────────────── */
