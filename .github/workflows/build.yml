@@ -1,0 +1,37 @@
+name: Build Single File Plugin
+
+on:
+  push:
+    branches:
+      - '**'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Build Single File HTML
+        run: bun run build
+
+      - name: Pack plugin
+        run: node scripts/pack-plugin.js
+
+      - name: Upload Zip Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugin-release
+          path: |
+            *.zip
+            dist/

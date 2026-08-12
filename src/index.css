@@ -1,0 +1,225 @@
+@import "tailwindcss";
+
+:root {
+  /* --- Material 3 Color roles (matched to Otzaria's light theme defaults) --- */
+  --color-primary: #8A4B27; /* Otzaria warm copper/brown primary */
+  --color-on-primary: #FFFFFF;
+  --color-primary-container: #FCE8DC;
+  --color-on-primary-container: #361400;
+
+  --color-secondary: #705B4E;
+  --color-on-secondary: #FFFFFF;
+  --color-secondary-container: #E2D7CC;
+  --color-on-secondary-container: #28180E;
+
+  --color-surface: #FFFDF9; /* Otzaria card / surface warm white */
+  --color-on-surface: #201A17; /* Main readable body text */
+  --color-on-surface-variant: #52443D; /* Muted secondary text */
+
+  --color-surface-container-lowest: #FFFFFF;
+  --color-surface-container-low: #FBF4EC;
+  --color-surface-container: #F5EFE6; /* Otzaria main canvas background */
+  --color-surface-container-high: #EFE8DC; /* Top toolbar / header bar background */
+  --color-surface-container-highest: #E8E0D2; /* Modals / popovers background */
+
+  --color-error: #BA1A1A;
+  --color-on-error: #FFFFFF;
+  --color-error-container: #FFDAD6;
+  --color-on-error-container: #410002;
+
+  --color-outline: #D7CCC0; /* Subtle warm borders */
+  --color-outline-variant: #E8E0D5;
+
+  /* --- Derived subtle colors --- */
+  --color-primary-subtle: rgba(138, 75, 39, 0.12);
+  --color-secondary-subtle: rgba(112, 91, 78, 0.12);
+
+  /* --- Typography --- */
+  --font-main: 'FrankRuhlCLM', 'Frank Ruhl Libre', 'TaameyDavidCLM', 'David', 'Rubik', serif;
+  --font-size-base: 18px;
+  --line-height: 1.5;
+
+  /* --- Shape --- */
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --radius-pill: 999px;
+}
+
+body {
+  font-family: var(--font-main);
+  font-size: var(--font-size-base);
+  line-height: var(--line-height);
+  background-color: var(--color-surface-container);
+  color: var(--color-on-surface);
+  direction: rtl;
+  margin: 0;
+  padding: 0;
+  min-height: 100vh;
+}
+
+body.dark-mode {
+  --color-primary: #FFB591;
+  --color-on-primary: #522300;
+  --color-primary-container: #6E3411;
+  --color-on-primary-container: #FFDBCB;
+
+  --color-secondary: #DDD0C3;
+  --color-on-secondary: #3E2D23;
+  --color-secondary-container: #4E3E34;
+  --color-on-secondary-container: #F0E2D7;
+
+  --color-surface: #1E1A17;
+  --color-on-surface: #ECE0DA;
+  --color-on-surface-variant: #D7C3B8;
+
+  --color-surface-container-lowest: #120F0D;
+  --color-surface-container-low: #191513;
+  --color-surface-container: #1E1A17;
+  --color-surface-container-high: #272320;
+  --color-surface-container-highest: #322D29;
+
+  --color-outline: #4E443E;
+  --color-outline-variant: #3B332E;
+
+  --color-primary-subtle: rgba(255, 181, 145, 0.15);
+  --color-secondary-subtle: rgba(221, 208, 195, 0.15);
+}
+
+/* Material 3 Styled Component Utilities */
+.otz-card {
+  background-color: var(--color-surface);
+  color: var(--color-on-surface);
+  border: 1px solid var(--color-outline-variant);
+  border-radius: var(--radius-md);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+}
+
+.otz-header-bar {
+  background-color: var(--color-surface-container-high);
+  color: var(--color-on-surface);
+  border-bottom: 1px solid var(--color-outline);
+}
+
+.otz-btn-primary {
+  background-color: var(--color-primary);
+  color: var(--color-on-primary);
+  border: none;
+  border-radius: var(--radius-sm);
+  padding: 8px 16px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+.otz-btn-primary:hover {
+  filter: brightness(1.08);
+}
+.otz-btn-primary:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.otz-btn-secondary {
+  background-color: var(--color-secondary-subtle);
+  color: var(--color-on-surface);
+  border: 1px solid var(--color-outline);
+  border-radius: var(--radius-sm);
+  padding: 8px 16px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+.otz-btn-secondary:hover {
+  background-color: var(--color-outline-variant);
+}
+
+.otz-input {
+  background-color: var(--color-surface);
+  color: var(--color-on-surface);
+  border: 1px solid var(--color-outline);
+  border-radius: var(--radius-sm);
+  padding: 8px 12px;
+  font-family: inherit;
+  font-size: 0.95em;
+  outline: none;
+  transition: border-color 0.15s ease;
+}
+.otz-input:focus {
+  border-color: var(--color-primary);
+}
+
+/* --- Drag & drop re-linking overlay --- */
+@keyframes otz-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes otz-drag-rise {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: none; }
+}
+
+@keyframes otz-just-linked {
+  0%   { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.55); }
+  40%  { box-shadow: 0 0 0 6px rgba(16, 185, 129, 0.28); }
+  100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
+}
+
+.otz-fade-in,
+.animate-fade-in {
+  animation: otz-fade-in 0.16s ease-out both;
+}
+
+.otz-drag-rise {
+  animation: otz-drag-rise 0.2s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+/* Rows fade in only — no transform, and no starting opacity of 0: hit-testing ignores
+   opacity, so an animated row would be droppable while still invisible / displaced. */
+.otz-drop-row {
+  animation: otz-drop-row-in 0.16s ease-out both;
+}
+
+@keyframes otz-drop-row-in {
+  from { opacity: 0.55; }
+  to { opacity: 1; }
+}
+
+.otz-just-linked {
+  animation: otz-just-linked 1.4s ease-out both;
+  border-color: rgb(16, 185, 129) !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .otz-fade-in,
+  .animate-fade-in,
+  .otz-drag-rise,
+  .otz-drop-row,
+  .otz-just-linked {
+    animation: none;
+  }
+
+  /* The drop rows also scale on hover and the ghost rides a transform — neither
+     should move for users who asked for reduced motion. */
+  .otz-drop-row {
+    transition: none !important;
+    transform: none !important;
+  }
+}
+
+/* Custom scrollbars matching Otzaria */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-outline);
+  border-radius: 999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-secondary);
+}
+

@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ps -W)",
+      "Bash(export QA_DATA=\"C:/Users/User/AppData/Local/Temp/claude/c--Users-User-Desktop-otzaria-links-plugin-main/155544ac-976f-4f28-99ca-24b36a6ca90e/scratchpad/data\")",
+      "Bash(node --max-old-space-size=8192 --import tsx qa/run.ts bench --heavy)"
+    ]
+  }
+}

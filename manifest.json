@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "id": "com.otzaria.links-generator",
+  "name": "מחולל קישורים",
+  "version": "1.0.0",
+  "description": "תוסף אוצריא לייצור קישורים (links.json) והדגשת דיבור המתחיל (ד\"ה) בפירושים לטקסט מקור",
+  "author": "D9",
+  "homepage": "https://github.com/Otzaria/otzaria",
+  "entrypoint": "index.html",
+  "minAppVersion": "0.9.93",
+  "sdkVersion": "1.x",
+  "stability": "stable",
+  "permissions": [
+    "app.info.read",
+    "library.books.read",
+    "library.content.read",
+    "plugin.storage.read",
+    "plugin.storage.write",
+    "ui.feedback",
+    "events.subscribe:theme.changed"
+  ],
+  "network": {
+    "enabled": false,
+    "allowlist": []
+  },
+  "contributes": {
+    "toolTab": {
+      "title": "מחולל קישורים",
+      "order": 150,
+      "allowOrderBeforeBuiltIns": false,
+      "defaultPinned": true,
+      "iconName": "link_24_regular"
+    }
+  }
+}

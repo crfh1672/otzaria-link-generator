@@ -1,0 +1,8 @@
+{
+  "name": "Remix תוסף אוצריא - מחולל קישורים ודיבור המתחיל",
+  "description": "תוסף אוצריא ליצירת קובץ קישורים (links.json) והדגשת דיבור המתחיל (DH) בפירושים לטקסט מקור",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
