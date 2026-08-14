@@ -55464,6 +55464,125 @@ function findPhraseByInitials(targetText: string, initials: string[]): string | 
   return null;
 }
 
+
+/**
+ * ── OPT-1 ────────────────────────────────────────────────────────────────────────────────
+ * Per-source-text expansion plan.
+ *
+ * The scan below splits into two halves that depend on different things:
+ *   • WHICH n-grams look like abbreviations and what the dictionary offers for them —
+ *     a pure function of `sourceText` and the dictionaries, which are fixed across a scan.
+ *   • WHICH of the offered options fits — the only half that depends on `targetContext`.
+ *
+ * The first half is the expensive one (five key spellings built and probed per n-gram) and
+ * it was recomputed for every candidate line even though the phrase being expanded does not
+ * change across a scan. The plan memoises exactly that half, per (idx, len) slot, LAZILY —
+ * so the slots built are precisely the ones the inline code would have computed, no more.
+ *
+ * Why it stays valid though the scan rewrites `words` as it goes: on a match the loop sets
+ * `idx = endIdx`, so it resumes strictly past every token it consumed and never re-reads a
+ * cell it wrote. Slices therefore always come from untouched original tokens — which is why
+ * the plan holds the ORIGINAL token array and every call clones it before writing.
+ */
+interface ExpansionSlot {
+  /** The n-gram exactly as the inline code joined it — later code still reads this. */
+  rawJoined: string;
+  /**
+   * Final value of the original lookup loop: `undefined` when nothing resolved, but
+   * possibly an EMPTY array, which is truthy and suppresses the initials fallback exactly
+   * as it does upstream.
+   */
+  options: string[] | undefined;
+  /** Geresh/gershayim test — gates the de-quoted indexes and the initials fallback. */
+  writtenAsAbbreviation: boolean;
+}
+
+interface ExpansionPlan {
+  /** Original tokenisation. Never mutated. */
+  words: string[];
+  nonWsIndices: number[];
+  /** slots[idx][len - 1] */
+  slots: Array<Array<ExpansionSlot | undefined> | undefined>;
+  dict: Record<string, string[]>;
+  reps: Record<string, string[]> | undefined;
+}
+
+const EXPANSION_PLAN_LIMIT = 8192;
+const expansionPlanCache = new Map<string, ExpansionPlan>();
+
+function getExpansionPlan(
+  sourceText: string,
+  dict: Record<string, string[]>,
+  reps: Record<string, string[]> | undefined
+): ExpansionPlan {
+  const hit = expansionPlanCache.get(sourceText);
+  if (hit !== undefined && hit.dict === dict && hit.reps === reps) return hit;
+
+  const words = sourceText.split(/(\s+)/);
+  const nonWsIndices: number[] = [];
+  for (let i = 0; i < words.length; i++) {
+    if (words[i].trim() !== '') nonWsIndices.push(i);
+  }
+
+  const plan: ExpansionPlan = {
+    words,
+    nonWsIndices,
+    slots: new Array(nonWsIndices.length),
+    dict,
+    reps
+  };
+  if (expansionPlanCache.size >= EXPANSION_PLAN_LIMIT) expansionPlanCache.clear();
+  expansionPlanCache.set(sourceText, plan);
+  return plan;
+}
+
+/** The context-independent half of the loop body, memoised per slot. */
+function getExpansionSlot(plan: ExpansionPlan, idx: number, len: number): ExpansionSlot {
+  let row = plan.slots[idx];
+  if (row === undefined) {
+    row = new Array(3);
+    plan.slots[idx] = row;
+  }
+  const cached = row[len - 1];
+  if (cached !== undefined) return cached;
+
+  const { words, nonWsIndices, dict, reps } = plan;
+  const iStart = nonWsIndices[idx];
+  const iEnd = nonWsIndices[idx + len - 1];
+
+  const sliceWords = words.slice(iStart, iEnd + 1);
+  const rawJoined = sliceWords.join('');
+  const cleanedJoined = cleanAbbrKey(rawJoined);
+  const noSpaceJoined = cleanedJoined.replace(/\s+/g, '');
+  const spaceJoined = sliceWords.map(w => cleanAbbrKey(w)).join(' ');
+  const rawNoSpace = rawJoined.replace(/\s+/g, '').replace(QUOTE_STRIP_RE, '');
+
+  const lookupKeys = [
+    rawJoined,
+    cleanedJoined,
+    noSpaceJoined,
+    spaceJoined,
+    rawNoSpace
+  ];
+
+  const writtenAsAbbreviation = QUOTE_GLYPHS_TEST_RE.test(rawJoined);
+
+  let options: string[] | undefined;
+  for (const k of lookupKeys) {
+    if (!k) continue;
+    options = dict[k]
+      || (reps && reps[k])
+      || NORMALIZED_REPLACEMENTS_MAP[k]
+      || CANONICAL_ABBREVIATIONS_MAP[canonicalAbbrKey(k)];
+    if (!options && writtenAsAbbreviation) options = NORMALIZED_ABBREVIATIONS_MAP[k];
+    if (options && options.length > 0) break;
+  }
+
+  const slot: ExpansionSlot = { rawJoined, options, writtenAsAbbreviation };
+  row[len - 1] = slot;
+  return slot;
+}
+
 /**
  * Searches for potential abbreviation expansions that match words in the target text.
  * Replaces abbreviations in `sourceText` with the matching option found in `targetContext`.
@@ -55493,15 +55612,11 @@ export function expandAbbreviationsInText(
   const targetNorm = stripNikud(targetContext);
   let targetDM: { dm: string; map: number[] } | null = null;
 
-  // Split sourceText into words/tokens
-  const words = sourceText.split(/(\s+)/);
-
-  const nonWsIndices: number[] = [];
-  for (let i = 0; i < words.length; i++) {
-    if (words[i].trim() !== '') {
-      nonWsIndices.push(i);
-    }
-  }
+  // OPT-1: tokenisation comes from the memoised plan. The array is still cloned per call,
+  // because the scan below rewrites it in place.
+  const plan = getExpansionPlan(sourceText, dict, customReplacements);
+  const words = plan.words.slice();
+  const nonWsIndices = plan.nonWsIndices;
 
   // An n-gram that starts inside the window may still reach one or two tokens past it;
   // that is deliberate, so the window boundary never splits a bigram or trigram.
@@ -55517,49 +55632,12 @@ export function expandAbbreviationsInText(
 
       const iStart = nonWsIndices[idx];
       const iEnd = nonWsIndices[endIdx];
-      const sliceWords = words.slice(iStart, iEnd + 1);
-      const rawJoined = sliceWords.join('');
-      const cleanedJoined = cleanAbbrKey(rawJoined);
-      const noSpaceJoined = cleanedJoined.replace(/\s+/g, '');
-      const spaceJoined = sliceWords.map(w => cleanAbbrKey(w)).join(' ');
-      const rawNoSpace = rawJoined.replace(/\s+/g, '').replace(QUOTE_STRIP_RE, '');
-
-      const lookupKeys = [
-        rawJoined,
-        cleanedJoined,
-        noSpaceJoined,
-        spaceJoined,
-        rawNoSpace
-      ];
-
-      // BUG-07, second half: the "only a token WRITTEN as an abbreviation may be re-read as
-      // one" rule was applied to the initials fallback below, but never to the dictionary
-      // lookup — and three of the five lookup keys above have their quotes stripped.
-      //
-      // NORMALIZED_ABBREVIATIONS_MAP indexes every entry under its de-quoted form, so ל"א is
-      // also reachable as לא. With 53 entries none of those forms was an ordinary word; at
-      // 13k entries 1,918 of them are (לא, על, הוא, ליה, של, נמי …), and the plain word in a
-      // quote would be re-read as an acronym and rewritten.
-      //
-      // The de-quoted forms therefore stay reachable only for a token that actually carries a
-      // geresh/gershayim. `dict` itself is still consulted unconditionally, so an entry whose
-      // key is genuinely written without quotes keeps matching a plain word exactly as before.
-      const writtenAsAbbreviation = QUOTE_GLYPHS_TEST_RE.test(rawJoined);
-
-      let options: string[] | undefined;
-      for (const k of lookupKeys) {
-        if (!k) continue;
-        // Replacements are word swaps whose keys carry no geresh by design, so they stay
-        // reachable for any token; only the abbreviation index requires one.
-        options = dict[k]
-          || (customReplacements && customReplacements[k])
-          || NORMALIZED_REPLACEMENTS_MAP[k]
-          // Canonical-geresh index: edition-independent, but a token with no mark can never
-          // reach an entry that has one, so ordinary words stay out of it entirely.
-          || CANONICAL_ABBREVIATIONS_MAP[canonicalAbbrKey(k)];
-        if (!options && writtenAsAbbreviation) options = NORMALIZED_ABBREVIATIONS_MAP[k];
-        if (options && options.length > 0) break;
-      }
+      // OPT-1: the context-free half — the key spellings, the geresh test and the dictionary
+      // probe — is memoised per (idx, len) instead of being rebuilt for every candidate line.
+      const slot = getExpansionSlot(plan, idx, len);
+      const rawJoined = slot.rawJoined;
+      const options = slot.options;
+      const writtenAsAbbreviation = slot.writtenAsAbbreviation;
 
       if (options && options.length > 0) {
         let matchedOption: string | null = null;
