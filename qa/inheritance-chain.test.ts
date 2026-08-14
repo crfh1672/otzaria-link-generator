@@ -10,7 +10,7 @@
  * Run: npx tsx qa/inheritance-chain.test.ts
  */
 
-import { collectInheritedFollowers, findInheritanceParent, cascadeInheritedContext, findPendingInheritanceHead, hasExplicitBaadMarker } from '../src/utils/inheritanceChain';
+import { collectInheritedFollowers, findInheritanceParent, cascadeInheritedContext, findPendingInheritanceHead, hasExplicitBaadMarker, buildInheritanceIndex } from '../src/utils/inheritanceChain';
 import type { OtzariaLink } from '../src/types';
 
 const L = (line: number, target: number, inherited: boolean, extra: Partial<OtzariaLink> = {}): OtzariaLink => ({
@@ -165,3 +165,34 @@ eq('line 7 stays out of it', resolved.some(l => l.line_index_1 === 7), false);
 // Unlinking the head again returns the frame to waiting.
 const backToWaiting = cascadeInheritedContext({ links: resolved.filter(l => l.line_index_1 !== 3), commentaryLines: waitLines, parentLineIdx1: 3, sourceLines, dhHighlights: waitHighlights });
 eq('unlinking the head empties the frame again', backToWaiting.map(l => l.line_index_1), [2]);
+
+/* ------------------------------------------------------------------------------------------
+ * buildInheritanceIndex reads the same chains as the per-line walkers — it exists only so the
+ * editor can ask about every row it renders without paying for a walk per row, and the moment
+ * the two disagree the list would describe a document that does not exist.
+ * ---------------------------------------------------------------------------------------- */
+
+const indexAgrees = (name: string, docLines: string[], docLinks: OtzariaLink[], manual?: Set<number>) => {
+  const index = buildInheritanceIndex(docLinks, docLines, manual);
+  const mismatches: unknown[] = [];
+  for (let lineIdx1 = 1; lineIdx1 <= docLines.length; lineIdx1++) {
+    const parent = index.parentByLine.get(lineIdx1) ?? null;
+    const walkedParent = findInheritanceParent(lineIdx1, docLinks, docLines, manual);
+    if (parent !== walkedParent) mismatches.push([lineIdx1, 'parent', parent, walkedParent]);
+
+    const followers = index.followerCountByLine.get(lineIdx1) ?? 0;
+    const walkedFollowers = collectInheritedFollowers(lineIdx1, docLinks, docLines, manual).length;
+    if (followers !== walkedFollowers) mismatches.push([lineIdx1, 'followers', followers, walkedFollowers]);
+
+    const pending = index.pendingHeadByLine.get(lineIdx1) ?? null;
+    const walkedPending = findPendingInheritanceHead(lineIdx1, docLinks, docLines, manual);
+    if (pending !== walkedPending) mismatches.push([lineIdx1, 'pending', pending, walkedPending]);
+  }
+  eq(name, mismatches, []);
+};
+
+indexAgrees('index agrees with the walkers — chains across a header', commentaryLines, links);
+indexAgrees('index agrees with the walkers — an ordinary line opening the segment', cutLines, links);
+indexAgrees('index agrees with the walkers — a bare source label mid-chain', labelLines, labelLinks);
+indexAgrees('index agrees with the walkers — lines waiting on a sourceless head', waitLines, waitLinks);
+indexAgrees('index agrees with the walkers — hand-marked lines', commentaryLines, links, new Set([4, 6]));

@@ -29,10 +29,8 @@ import { DragRelinkOverlay } from './DragRelinkOverlay';
 import { useDragRelink } from '../hooks/useDragRelink';
 import { buildDragCandidates, parseDropId } from '../utils/dragCandidates';
 import {
+  buildInheritanceIndex,
   cascadeInheritedContext,
-  collectInheritedFollowers,
-  findInheritanceParent,
-  findPendingInheritanceHead,
   markLineAsInherited,
   unmarkLineAsInherited
 } from '../utils/inheritanceChain';
@@ -490,6 +488,39 @@ export const EditMode: React.FC<EditModeProps> = ({
     config
   } = session;
 
+  /**
+   * Every line's place in its inheritance chain, for the whole document at once.
+   *
+   * Each row shows what it inherits from and what follows it, and asking the per-line walkers
+   * for that means a fresh lookup of every link per row — quadratic, and paid again on every
+   * render, including the ones a selection click causes.
+   */
+  const inheritanceIndex = useMemo(
+    () => buildInheritanceIndex(links, commentaryLines, manualInheritSet),
+    [links, commentaryLines, manualInheritSet]
+  );
+
+  /**
+   * The rendered markup of a commentary line, kept per line: it is pure string work over the
+   * line and its Dibur Hamatchil, and re-doing it for every row on a render that changed
+   * neither is the other half of the cost of a click.
+   */
+  const lineHtml = useMemo(() => {
+    const cache = new Map<number, string>();
+    return (lineIdx1: number) => {
+      const cached = cache.get(lineIdx1);
+      if (cached !== undefined) return cached;
+      const html = formatLineWithDH(
+        commentaryLines[lineIdx1 - 1] || '',
+        dhHighlights[lineIdx1] || { wordStart: 0, wordCount: 3 },
+        `comm-match-${lineIdx1}`,
+        false
+      );
+      cache.set(lineIdx1, html);
+      return html;
+    };
+  }, [commentaryLines, dhHighlights]);
+
   const rashiLinksBySecondaryLine = useMemo(() => {
     const map: Record<number, OtzariaLink[]> = {};
     links.forEach(link => {
@@ -554,12 +585,12 @@ export const EditMode: React.FC<EditModeProps> = ({
       const lineIdx1 = idx + 1;
       if (!line.trim() || linkedCommLineIndices.has(lineIdx1)) return;
       if (isFrontMatterLine(lineIdx1)) return;
-      const head = findPendingInheritanceHead(lineIdx1, links, commentaryLines, manualInheritSet);
+      const head = inheritanceIndex.pendingHeadByLine.get(lineIdx1);
       // A chain never reaches back into the front matter, which the parser skipped entirely.
-      if (head !== null && !isFrontMatterLine(head)) heads[lineIdx1] = head;
+      if (head !== undefined && !isFrontMatterLine(head)) heads[lineIdx1] = head;
     });
     return heads;
-  }, [commentaryLines, links, linkedCommLineIndices, isFrontMatterLine, manualInheritSet]);
+  }, [commentaryLines, linkedCommLineIndices, isFrontMatterLine, inheritanceIndex]);
 
   // Unlinked commentary lines. A בא"ד line waiting on the line above it is not counted on its
   // own — linking that line resolves both, so the frame is a single line to deal with.
@@ -964,7 +995,7 @@ export const EditMode: React.FC<EditModeProps> = ({
     if (!parsed) return;
 
     // Counted before the save, while `links` still describes the chain as the user saw it.
-    const followerCount = collectInheritedFollowers(commLineIdx1, links, commentaryLines, manualInheritSet).length;
+    const followerCount = inheritanceIndex.followerCountByLine.get(commLineIdx1) ?? 0;
     const targets = actionTargets(commLineIdx1);
 
     handleSaveLink(
@@ -986,7 +1017,7 @@ export const EditMode: React.FC<EditModeProps> = ({
     // The overlay unmounts on commit, so the result is announced from here, where the
     // live region stays in the tree.
     setDragAnnouncement(`${subject} אל ${label}, שורה ${parsed.index}${followerNote}`);
-  }, [handleSaveLink, config.targetBookName, links, commentaryLines, manualInheritSet, actionTargets]);
+  }, [handleSaveLink, config.targetBookName, inheritanceIndex, actionTargets]);
 
   const handleCancelDrop = useCallback(() => {
     setDragAnnouncement('הגרירה בוטלה, הקישור לא שונה');
@@ -1097,7 +1128,6 @@ export const EditMode: React.FC<EditModeProps> = ({
     const { onRowClick, pointerCursor = false, selectable = false } = options ?? {};
     const lineIdx1 = linkObj ? linkObj.line_index_1 : commIdx1!;
     const rawLineText = commentaryLines[lineIdx1 - 1] || '';
-    const highlight = dhHighlights[lineIdx1] || { wordStart: 0, wordCount: 3 };
 
     const isUnlinked = !linkObj;
     // Front matter carries no link by design, so it is never dressed as a missing one.
@@ -1107,10 +1137,10 @@ export const EditMode: React.FC<EditModeProps> = ({
     const pendingHead = isUnlinked ? pendingInheritanceHeads[lineIdx1] : undefined;
     const isPendingInheritance = pendingHead !== undefined;
     const isInherited = Boolean(linkObj?.isInherited) || isPendingInheritance;
-    const inheritanceParent = findInheritanceParent(lineIdx1, links, commentaryLines, manualInheritSet);
+    const inheritanceParent = inheritanceIndex.parentByLine.get(lineIdx1) ?? null;
     // Lines below this one that carry its context — they move with it on every re-link, and
     // an unlinked head drags along the בא"ד lines waiting on it.
-    const inheritedFollowerCount = collectInheritedFollowers(lineIdx1, links, commentaryLines, manualInheritSet).length;
+    const inheritedFollowerCount = inheritanceIndex.followerCountByLine.get(lineIdx1) ?? 0;
 
     const isSelected = selectable && selectedLines.has(lineIdx1);
     const bulkTargets = actionTargets(lineIdx1);
@@ -1135,7 +1165,7 @@ export const EditMode: React.FC<EditModeProps> = ({
       bgStyle = "bg-[var(--color-surface-container-high)] text-[var(--color-on-surface)] border-[var(--color-outline)]";
     }
 
-    const formattedHtml = formatLineWithDH(rawLineText, highlight, `comm-match-${lineIdx1}`, false);
+    const formattedHtml = lineHtml(lineIdx1);
 
     const isJustLinked = justLinkedCommLineIdx === lineIdx1;
 

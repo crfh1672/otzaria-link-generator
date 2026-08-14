@@ -294,6 +294,116 @@ export function cascadeInheritedContext(params: {
   return [...updated, ...created];
 }
 
+/* --------------------------------------------------------------------------------------------
+ * The whole document's chains in one pass
+ * ----------------------------------------------------------------------------------------- */
+
+/** What a line is to the chain running through it. */
+type ChainRole =
+  | 'header'
+  /** Blank, or a bare source label the parser skipped: the chain runs straight through it. */
+  | 'skip'
+  /** Inherits its context from the head above it — including a line still waiting for one. */
+  | 'member'
+  /** Owns its target, or found no source and does not continue the line above: a chain starts here. */
+  | 'head';
+
+/**
+ * Every line's place in its chain, for a whole document, in two linear passes.
+ *
+ * `findInheritanceParent` and `collectInheritedFollowers` answer the same questions for one line
+ * at a time, and each rebuilds a lookup of every link to do it — which is fine for an edit, and
+ * quadratic when the editor asks for every row it renders. The rules below are the same rules,
+ * read forwards once for the parents and backwards once for the follower counts.
+ */
+export interface InheritanceIndex {
+  /** Line → the head it inherits its context from, or null when nothing above it can be one. */
+  parentByLine: Map<number, number>;
+  /** Line → how many lines below it carry its context (what `collectInheritedFollowers` counts). */
+  followerCountByLine: Map<number, number>;
+  /** Line → the sourceless head it is waiting on (what `findPendingInheritanceHead` answers). */
+  pendingHeadByLine: Map<number, number>;
+}
+
+export function buildInheritanceIndex(
+  links: OtzariaLink[],
+  commentaryLines: string[],
+  manualInherit?: ManualInheritLines
+): InheritanceIndex {
+  const lineCount = commentaryLines.length;
+  const linkByLine = new Map(links.map(l => [l.line_index_1, l]));
+
+  // The first content line at or after each position — the scan `firstContentLineIsBaad` does per
+  // header, done once for the whole document.
+  const nextContent = new Array<number>(lineCount + 2).fill(0);
+  for (let i = lineCount; i >= 1; i--) {
+    const raw = commentaryLines[i - 1] ?? '';
+    nextContent[i] = (!raw.trim() || isHeaderLine(raw)) ? nextContent[i + 1] : i;
+  }
+
+  const roles = new Array<ChainRole>(lineCount + 1);
+  /** For a header: whether the chain survives it, i.e. the segment it opens continues the line above. */
+  const headerCrossed = new Array<boolean>(lineCount + 1).fill(false);
+
+  for (let i = 1; i <= lineCount; i++) {
+    const raw = commentaryLines[i - 1] ?? '';
+    if (isHeaderLine(raw)) {
+      roles[i] = 'header';
+      const opener = nextContent[i + 1];
+      headerCrossed[i] = opener > 0 && continuesLineAbove(opener, commentaryLines[opener - 1] ?? '', manualInherit);
+      continue;
+    }
+    if (!raw.trim()) {
+      roles[i] = 'skip';
+      continue;
+    }
+    const link = linkByLine.get(i);
+    if (!link && isBareSourceLabelLine(raw)) {
+      roles[i] = 'skip';
+      continue;
+    }
+    if (link) {
+      roles[i] = link.isInherited ? 'member' : 'head';
+      continue;
+    }
+    roles[i] = continuesLineAbove(i, raw, manualInherit) ? 'member' : 'head';
+  }
+
+  // A header is recorded like any other line — the walkers answer for one too, and they read the
+  // lines around it, not the header's own crossing rule, which only ever governs what is below it.
+  const parentByLine = new Map<number, number>();
+  const pendingHeadByLine = new Map<number, number>();
+  let head: number | null = null;
+  for (let i = 1; i <= lineCount; i++) {
+    if (head !== null) parentByLine.set(i, head);
+    // A line with no link that continues the line above it waits with its head, as long as the
+    // head has not been linked either — once it has, the line inherits and stops waiting.
+    if (head !== null && roles[i] === 'member' && !linkByLine.has(i) && !linkByLine.has(head)) {
+      pendingHeadByLine.set(i, head);
+    }
+    if (roles[i] === 'header') {
+      if (!headerCrossed[i]) head = null;
+    } else if (roles[i] === 'head') {
+      head = i;
+    }
+  }
+
+  const followerCountByLine = new Map<number, number>();
+  let membersBelow = 0;
+  for (let i = lineCount; i >= 1; i--) {
+    if (membersBelow > 0) followerCountByLine.set(i, membersBelow);
+    if (roles[i] === 'header') {
+      if (!headerCrossed[i]) membersBelow = 0;
+    } else if (roles[i] === 'member') {
+      membersBelow += 1;
+    } else if (roles[i] === 'head') {
+      membersBelow = 0;
+    }
+  }
+
+  return { parentByLine, followerCountByLine, pendingHeadByLine };
+}
+
 /**
  * Declare by hand that `lineIdx1` continues the line above it, exactly as a בא"ד line does:
  * the line gives up any target of its own and takes the one its chain head holds. When the head
