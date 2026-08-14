@@ -20,7 +20,7 @@ export const SingleHtmlExporterModal: React.FC<SingleHtmlExporterModalProps> = (
         schemaVersion: 1,
         id: "com.otzaria.links-generator",
         name: "מחולל קישורים",
-        version: "1.0.0",
+        version: "1.5.0",
         description: "תוסף אוצריא לייצור קישורים (links.json) והדגשת דיבור המתחיל (ד\"ה)",
         author: "מפתח אוצריא",
         homepage: "https://github.com/Otzaria/otzaria",

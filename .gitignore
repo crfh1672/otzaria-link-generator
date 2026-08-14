@@ -21,3 +21,16 @@ yarn-error.log*
 Thumbs.db
 .vscode/
 .idea/
+.claude/
+
+# QA fixtures - regenerate with `node qa/extract-books.mjs` (see qa/README.md)
+qa/data/
+
+# Scratch probes / one-off diagnostics
+src/utils/_*_probe.ts
+qa/*-probe.ts
+qa/single-word-dh*
+
+# Profiler output
+__prof_now/
+*.cpuprofile
