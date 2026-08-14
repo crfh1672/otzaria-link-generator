@@ -1,5 +1,13 @@
 import { OtzariaLink, PluginConfig, DHHighlight } from '../types';
-import { expandAbbreviationsInText, DEFAULT_ABBREVIATIONS, NORMALIZED_ABBREVIATIONS_MAP } from '../data/abbreviations';
+import { expandAbbreviationsInText, DEFAULT_ABBREVIATIONS, NORMALIZED_ABBREVIATIONS_MAP, ABBR_MARK } from '../data/abbreviations';
+
+/**
+ * FIX ח׳ — a resolved abbreviation keeps ONE slot of the maxDhWords cap and bridges the run,
+ * but contributes only this share of what the words it opened into would have scored.
+ * Proportional rather than flat: a long expansion is still worth more than a short one, so the
+ * (globally capped, 1.5) acceptance bar keeps its meaning.
+ */
+const ABBR_DAMP = 0.6;
 import { getWordSimilarity, getNikudFingerprint, levenshteinDistance } from './fuzzyUtils';
 import { getCombinedWordWeight, calculateDocumentIdfWeights } from './wordWeights';
 
@@ -1502,28 +1510,52 @@ export function runLinkingParser(
       let bestSimSum = 0;
       for (let startWIdx = 0; startWIdx < maxStartIdx; startWIdx++) {
         for (let docWIdx = 0; docWIdx < maxDocWIdx; docWIdx++) {
-          let k = 0;
+          let k = 0;      // source ITEMS consumed
+          let kt = 0;     // target WORDS consumed
           let seqScore = 0;
           let simSum = 0;
           while (
             startWIdx + k < cappedSource.length &&
-            docWIdx + k < targetWords.length
+            docWIdx + kt < targetWords.length
           ) {
             const w1 = cappedSource[startWIdx + k];
-            const w2 = targetWords[docWIdx + k];
+            if (w1.indexOf(ABBR_MARK) !== -1) {
+              const parts = w1.split(ABBR_MARK);
+              const orig = parts[0];
+              const exp = parts.slice(1);
+              if (exp.length === 0 || docWIdx + kt + exp.length > targetWords.length) break;
+              let ok = true;
+              let partSim = 0;
+              let partWeight = 0;
+              for (let j = 0; j < exp.length; j++) {
+                const s = getWordSimilarity(exp[j], targetWords[docWIdx + kt + j], enableFuzzy);
+                if (s <= 0) { ok = false; break; }
+                partSim += s;
+                partWeight += s * getCombinedWordWeight(exp[j], enableWordWeighting, idfMap);
+              }
+              if (!ok) break;
+              const ownWeight = getCombinedWordWeight(orig, enableWordWeighting, idfMap);
+              seqScore += Math.max(ownWeight, ABBR_DAMP * partWeight);
+              simSum += partSim / exp.length;
+              kt += exp.length;
+              k++;
+              continue;
+            }
+            const w2 = targetWords[docWIdx + kt];
             const sim = getWordSimilarity(w1, w2, enableFuzzy);
             if (sim <= 0) break;
             seqScore += sim * sourceWeights[startWIdx + k];
             simSum += sim;
+            kt++;
             k++;
           }
-          // A deep anchor has to earn its position with a genuine contiguous run; a shallow
-          // one is accepted on any run length, exactly as before. This is the only guard
-          // standing in for the old blanket position cap.
-          if (docWIdx >= SHALLOW_ANCHOR_LIMIT && k < DEEP_ANCHOR_MIN_RUN) continue;
+          // FIX ח׳: this guard was written to count WORDS of the target. Once an abbreviation
+          // collapses into one source item the two stopped being the same number, so count the
+          // target words actually consumed.
+          if (docWIdx >= SHALLOW_ANCHOR_LIMIT && kt < DEEP_ANCHOR_MIN_RUN) continue;
           if (seqScore > maxSeqScore) {
             maxSeqScore = seqScore;
-            bestWordCount = k;
+            bestWordCount = kt;
             bestSimSum = simSum;
           }
         }
@@ -1658,12 +1690,18 @@ export function runLinkingParser(
         // String `===` is a value comparison, and value is exactly the right test here: if
         // expansion produced text equal to its input, normalising it must reproduce words we
         // already hold, so we reuse that array instead of re-deriving it.
+        // FIX ו׳: normalise each token on its own so the unit marker survives — normalizeText
+        // drops every character outside [Hebrew, digits, space, ' and "].
+        const normKeepMark = (t: string): string[] =>
+          t.split(/\s+/).filter(Boolean)
+            .map(tok => tok.split(ABBR_MARK).map(p => normalizeText(p).replace(/\s+/g, ' ').trim()).filter(Boolean).join(ABBR_MARK))
+            .filter(Boolean);
         const expSearchWords = expSearchPhrase === searchPhrase
           ? normSearchWords
-          : normalizeText(expSearchPhrase).split(/\s+/).filter(Boolean);
+          : normKeepMark(expSearchPhrase);
         const expFullWords = expFullLineText === fullLineText
           ? fullWords
-          : normalizeText(expFullLineText).split(/\s+/).filter(Boolean);
+          : normKeepMark(expFullLineText);
         const expDocWords = expDocLineNorm === docLineNorm
           ? reNormalizedWords(cachedLine, docLineNorm)
           : normalizeText(expDocLineNorm).split(/\s+/).filter(Boolean);
