@@ -19,7 +19,8 @@ import {
   X,
   Bookmark,
   ListTree,
-  Search
+  Search,
+  CornerRightUp
 } from 'lucide-react';
 import { HeaderSegment } from '../utils/parserAlgorithm';
 
@@ -31,7 +32,9 @@ import {
   cascadeInheritedContext,
   collectInheritedFollowers,
   findInheritanceParent,
-  findPendingInheritanceHead
+  findPendingInheritanceHead,
+  markLineAsInherited,
+  unmarkLineAsInherited
 } from '../utils/inheritanceChain';
 
 const getTargetColors = (target?: 'rashi' | 'tosafot' | 'primary' | string) => {
@@ -251,6 +254,32 @@ export const EditMode: React.FC<EditModeProps> = ({
   const [editingCommLineIdx, setEditingCommLineIdx] = useState<number | null>(null);
   /** Commentary line that was just re-linked — drives the confirmation flash. */
   const [justLinkedCommLineIdx, setJustLinkedCommLineIdx] = useState<number | null>(null);
+
+  /**
+   * Rows picked with Ctrl/⌘-click (Shift-click for a run of them). Every per-row control acts on
+   * the whole set when the row it sits on belongs to it, which is what makes editing several
+   * lines together possible without a second set of controls anywhere on screen.
+   */
+  const [selectedLines, setSelectedLines] = useState<ReadonlySet<number>>(() => new Set());
+  /** Where the last plain pick landed — the far end of a Shift-click range. */
+  const [selectionAnchor, setSelectionAnchor] = useState<number | null>(null);
+
+  /** Lines the user declared by hand as continuing the line above them. */
+  const manualInheritSet = useMemo(
+    () => new Set(session.manualInheritLines ?? []),
+    [session.manualInheritLines]
+  );
+
+  /**
+   * The lines an action fired from `lineIdx1` applies to: the whole selection when that row is
+   * part of it, and the row on its own otherwise. Ascending, because attaching a line to the
+   * chain above it depends on the lines before it already being attached.
+   */
+  const actionTargets = useCallback(
+    (lineIdx1: number): number[] =>
+      selectedLines.has(lineIdx1) ? Array.from(selectedLines).sort((a, b) => a - b) : [lineIdx1],
+    [selectedLines]
+  );
   /** Screen-reader announcement for the outcome of a drag session. */
   const [dragAnnouncement, setDragAnnouncement] = useState('');
 
@@ -382,14 +411,16 @@ export const EditMode: React.FC<EditModeProps> = ({
   };
 
   const handleToggleLinkApproval = (commLineIdx1: number) => {
-    const updatedLinks = session.links.map(l => {
-      if (l.line_index_1 === commLineIdx1) {
-        const currentStatus = l.status || 'approved';
-        const nextStatus: 'approved' | 'pending' = currentStatus === 'approved' ? 'pending' : 'approved';
-        return { ...l, status: nextStatus };
-      }
-      return l;
-    });
+    // The row that was clicked decides the direction, and the rest of the selection follows it —
+    // otherwise a mixed selection would just flip into a differently mixed one.
+    const targets = new Set(actionTargets(commLineIdx1));
+    const clicked = session.links.find(l => l.line_index_1 === commLineIdx1);
+    const nextStatus: 'approved' | 'pending' =
+      (clicked?.status || 'approved') === 'approved' ? 'pending' : 'approved';
+
+    const updatedLinks = session.links.map(l =>
+      targets.has(l.line_index_1) ? { ...l, status: nextStatus } : l
+    );
     onUpdateSession({
       ...session,
       links: updatedLinks,
@@ -438,7 +469,8 @@ export const EditMode: React.FC<EditModeProps> = ({
       sourceLines: session.sourceLines,
       rashiLines: session.rashiLines,
       tosafotLines: session.tosafotLines,
-      dhHighlights: session.dhHighlights
+      dhHighlights: session.dhHighlights,
+      manualInherit: manualInheritSet
     });
 
     onUpdateSession({
@@ -522,12 +554,12 @@ export const EditMode: React.FC<EditModeProps> = ({
       const lineIdx1 = idx + 1;
       if (!line.trim() || linkedCommLineIndices.has(lineIdx1)) return;
       if (isFrontMatterLine(lineIdx1)) return;
-      const head = findPendingInheritanceHead(lineIdx1, links, commentaryLines);
+      const head = findPendingInheritanceHead(lineIdx1, links, commentaryLines, manualInheritSet);
       // A chain never reaches back into the front matter, which the parser skipped entirely.
       if (head !== null && !isFrontMatterLine(head)) heads[lineIdx1] = head;
     });
     return heads;
-  }, [commentaryLines, links, linkedCommLineIndices, isFrontMatterLine]);
+  }, [commentaryLines, links, linkedCommLineIndices, isFrontMatterLine, manualInheritSet]);
 
   // Unlinked commentary lines. A בא"ד line waiting on the line above it is not counted on its
   // own — linking that line resolves both, so the frame is a single line to deal with.
@@ -678,19 +710,21 @@ export const EditMode: React.FC<EditModeProps> = ({
     return groups;
   }, [sortedCommentaryIndices, links, pendingInheritanceHeads]);
 
-  // Add / Update / Remove Link
-  const handleSaveLink = (
+  // Add / Update / Remove the link of a single line, over a links array that may already carry
+  // the result of the same edit applied to the lines above it (see handleSaveLink).
+  const applyLinkToLine = (
+    currentLinks: OtzariaLink[],
     commLineIdx1: number,
     newSourceLineIdx: number | null,
     secondaryTarget?: 'rashi' | 'tosafot'
-  ) => {
-    let updatedLinks = [...links];
+  ): OtzariaLink[] => {
+    let updatedLinks = [...currentLinks];
 
-    const previousLink = links.find(l => l.line_index_1 === commLineIdx1);
+    const previousLink = currentLinks.find(l => l.line_index_1 === commLineIdx1);
     updatedLinks = updatedLinks.filter(l => l.line_index_1 !== commLineIdx1);
 
     if (newSourceLineIdx && newSourceLineIdx >= 1) {
-      if (!secondaryTarget && newSourceLineIdx > sourceLines.length) return;
+      if (!secondaryTarget && newSourceLineIdx > sourceLines.length) return currentLinks;
 
       const headerTitle = config.targetBookName;
       const isSecondary = Boolean(secondaryTarget);
@@ -765,22 +799,149 @@ export const EditMode: React.FC<EditModeProps> = ({
     // same frame, which receives its inherited link here. If the link was removed instead,
     // those inherited links are dropped and the lines go back to waiting together.
     // Lines ABOVE the edited one inherit from an earlier head and stay as they are.
-    updatedLinks = cascadeInheritedContext({
+    return cascadeInheritedContext({
       links: updatedLinks,
       commentaryLines,
       parentLineIdx1: commLineIdx1,
       sourceLines,
       rashiLines,
       tosafotLines,
-      dhHighlights
+      dhHighlights,
+      manualInherit: manualInheritSet
     });
+  };
+
+  /**
+   * Save from a row control: the same target is applied to every line the action covers — the
+   * row alone, or the whole selection when the row belongs to it. Applied in document order over
+   * an accumulating array, so each line sees the chain as the lines above it left it.
+   */
+  const handleSaveLink = (
+    commLineIdx1: number,
+    newSourceLineIdx: number | null,
+    secondaryTarget?: 'rashi' | 'tosafot'
+  ) => {
+    const targets = actionTargets(commLineIdx1);
+    const updatedLinks = targets.reduce(
+      (acc, lineIdx1) => applyLinkToLine(acc, lineIdx1, newSourceLineIdx, secondaryTarget),
+      links
+    );
+
+    // A line the user gave a target of its own no longer continues the line above it. Removing
+    // the link is not such a statement — the line goes back to waiting on its head, exactly as a
+    // בא"ד line does.
+    const nextManual = newSourceLineIdx === null
+      ? manualInheritSet
+      : new Set(Array.from(manualInheritSet).filter(lineIdx1 => !targets.includes(lineIdx1)));
 
     onUpdateSession({
       ...session,
       links: updatedLinks,
+      manualInheritLines: Array.from(nextManual).sort((a, b) => a - b),
       lastModifiedTimestamp: Date.now()
     });
   };
+
+  /**
+   * Declare the lines an action covers to be continuations of the line above them — or give them
+   * back their independence. The row that was clicked decides the direction for the whole
+   * selection, so a mixed selection resolves into one state instead of flipping line by line.
+   */
+  const handleToggleInheritance = (commLineIdx1: number) => {
+    const targets = actionTargets(commLineIdx1);
+    const clickedLink = links.find(l => l.line_index_1 === commLineIdx1);
+    const detach = Boolean(clickedLink?.isInherited) || manualInheritSet.has(commLineIdx1);
+
+    let workingLinks = links;
+    let workingManual: ReadonlySet<number> = manualInheritSet;
+
+    targets.forEach(lineIdx1 => {
+      if (detach) {
+        const next = unmarkLineAsInherited({
+          links: workingLinks,
+          lineIdx1,
+          manualInherit: workingManual
+        });
+        workingLinks = next.links;
+        workingManual = next.manualInherit;
+        return;
+      }
+      const next = markLineAsInherited({
+        links: workingLinks,
+        commentaryLines,
+        lineIdx1,
+        manualInherit: workingManual,
+        sourceLines,
+        rashiLines,
+        tosafotLines,
+        dhHighlights
+      });
+      // null means there is nothing above this line to continue — it is left as it was.
+      if (next) {
+        workingLinks = next.links;
+        workingManual = next.manualInherit;
+      }
+    });
+
+    onUpdateSession({
+      ...session,
+      links: workingLinks,
+      manualInheritLines: Array.from(workingManual).sort((a, b) => a - b),
+      lastModifiedTimestamp: Date.now()
+    });
+  };
+
+  /* ------------------------------------------------------------------
+   * Selecting several rows to act on together
+   * ------------------------------------------------------------------ */
+
+  /** Rendered order, which is what a Shift-click range means on screen. */
+  const renderPositionByLine = useMemo(() => {
+    const positions = new Map<number, number>();
+    sortedCommentaryIndices.forEach((idx, position) => positions.set(idx + 1, position));
+    return positions;
+  }, [sortedCommentaryIndices]);
+
+  const handleRowSelectClick = useCallback((lineIdx1: number, event: React.MouseEvent) => {
+    const isRangePick = event.shiftKey && selectionAnchor !== null;
+    const isTogglePick = event.ctrlKey || event.metaKey;
+
+    if (isRangePick) {
+      const from = renderPositionByLine.get(selectionAnchor!);
+      const to = renderPositionByLine.get(lineIdx1);
+      if (from === undefined || to === undefined) return;
+      const [start, end] = from <= to ? [from, to] : [to, from];
+      const range = sortedCommentaryIndices.slice(start, end + 1).map(idx => idx + 1);
+      setSelectedLines(prev => new Set([...prev, ...range]));
+      return;
+    }
+
+    if (isTogglePick) {
+      setSelectedLines(prev => {
+        const next = new Set(prev);
+        if (next.has(lineIdx1)) next.delete(lineIdx1);
+        else next.add(lineIdx1);
+        return next;
+      });
+      setSelectionAnchor(lineIdx1);
+      return;
+    }
+
+    // A plain click drops the selection — and nothing else, so clicking a row to read it never
+    // changes anything. It does mark where a following Shift-click range starts, which is what
+    // makes "click here, Shift-click there" work without a modifier on the first click.
+    setSelectionAnchor(lineIdx1);
+    if (selectedLines.size > 0) setSelectedLines(new Set());
+  }, [selectionAnchor, selectedLines, renderPositionByLine, sortedCommentaryIndices]);
+
+  // A selection that survives a filter change would act on rows the user can no longer see.
+  useEffect(() => {
+    setSelectedLines(prev => {
+      if (prev.size === 0) return prev;
+      const visible = Array.from(prev).filter(lineIdx1 => renderPositionByLine.has(lineIdx1));
+      return visible.length === prev.size ? prev : new Set(visible);
+    });
+  }, [renderPositionByLine]);
 
   /* ------------------------------------------------------------------
    * Drag & drop re-linking (pointer based — mouse, touch, pen + keyboard)
@@ -803,7 +964,8 @@ export const EditMode: React.FC<EditModeProps> = ({
     if (!parsed) return;
 
     // Counted before the save, while `links` still describes the chain as the user saw it.
-    const followerCount = collectInheritedFollowers(commLineIdx1, links, commentaryLines).length;
+    const followerCount = collectInheritedFollowers(commLineIdx1, links, commentaryLines, manualInheritSet).length;
+    const targets = actionTargets(commLineIdx1);
 
     handleSaveLink(
       commLineIdx1,
@@ -818,10 +980,13 @@ export const EditMode: React.FC<EditModeProps> = ({
     const followerNote = followerCount > 0
       ? `, ועמן ${followerCount} שורות שיורשות את ההקשר ממנה`
       : '';
+    const subject = targets.length > 1
+      ? `${targets.length} השורות שנבחרו קושרו`
+      : `שורה ${commLineIdx1} קושרה`;
     // The overlay unmounts on commit, so the result is announced from here, where the
     // live region stays in the tree.
-    setDragAnnouncement(`שורה ${commLineIdx1} קושרה אל ${label}, שורה ${parsed.index}${followerNote}`);
-  }, [handleSaveLink, config.targetBookName, links, commentaryLines]);
+    setDragAnnouncement(`${subject} אל ${label}, שורה ${parsed.index}${followerNote}`);
+  }, [handleSaveLink, config.targetBookName, links, commentaryLines, manualInheritSet, actionTargets]);
 
   const handleCancelDrop = useCallback(() => {
     setDragAnnouncement('הגרירה בוטלה, הקישור לא שונה');
@@ -918,7 +1083,18 @@ export const EditMode: React.FC<EditModeProps> = ({
   useEffect(() => () => window.clearTimeout(highlightTimerRef.current), []);
 
   // Render a commentary line box
-  const renderCommentaryBox = (linkObj?: OtzariaLink, commIdx1?: number, onRowClick?: () => void) => {
+  const renderCommentaryBox = (
+    linkObj?: OtzariaLink,
+    commIdx1?: number,
+    options?: {
+      onRowClick?: (event: React.MouseEvent) => void;
+      /** The unlinked panel's rows are buttons in spirit — the main list's rows are not. */
+      pointerCursor?: boolean;
+      /** Only the main list shows the selection: the panel renders a second copy of the row. */
+      selectable?: boolean;
+    }
+  ) => {
+    const { onRowClick, pointerCursor = false, selectable = false } = options ?? {};
     const lineIdx1 = linkObj ? linkObj.line_index_1 : commIdx1!;
     const rawLineText = commentaryLines[lineIdx1 - 1] || '';
     const highlight = dhHighlights[lineIdx1] || { wordStart: 0, wordCount: 3 };
@@ -931,12 +1107,24 @@ export const EditMode: React.FC<EditModeProps> = ({
     const pendingHead = isUnlinked ? pendingInheritanceHeads[lineIdx1] : undefined;
     const isPendingInheritance = pendingHead !== undefined;
     const isInherited = Boolean(linkObj?.isInherited) || isPendingInheritance;
-    const inheritanceParent = isInherited
-      ? findInheritanceParent(lineIdx1, links, commentaryLines)
-      : null;
+    const inheritanceParent = findInheritanceParent(lineIdx1, links, commentaryLines, manualInheritSet);
     // Lines below this one that carry its context — they move with it on every re-link, and
     // an unlinked head drags along the בא"ד lines waiting on it.
-    const inheritedFollowerCount = collectInheritedFollowers(lineIdx1, links, commentaryLines).length;
+    const inheritedFollowerCount = collectInheritedFollowers(lineIdx1, links, commentaryLines, manualInheritSet).length;
+
+    const isSelected = selectable && selectedLines.has(lineIdx1);
+    const bulkTargets = actionTargets(lineIdx1);
+    const isBulkAction = selectable && bulkTargets.length > 1;
+    const bulkNote = isBulkAction ? ` · הפעולה תחול על ${bulkTargets.length} השורות שנבחרו` : '';
+
+    // Whether the inheritance state of this line can be turned around at all: an inherited line
+    // can be freed as long as it holds a link of its own or was marked by hand, and a line that
+    // is not inherited can only be attached when there is a line above it to attach to. What
+    // cannot be undone from here is a בא"ד line still waiting for its head: the continuation is
+    // written in its own text, and it has no link to hand back to it.
+    const canToggleInheritance = isInherited
+      ? (Boolean(linkObj?.isInherited) || manualInheritSet.has(lineIdx1))
+      : inheritanceParent !== null;
 
     let bgStyle = "bg-transparent text-[var(--color-on-surface)] border-[var(--color-outline-variant)]";
     if (isFrontMatter) {
@@ -957,11 +1145,11 @@ export const EditMode: React.FC<EditModeProps> = ({
         key={`comm-${lineIdx1}`}
         onClick={onRowClick && (event => {
           // The row carries its own controls — the drag handle, the approval toggle, the
-          // edit button. Each owns its click; only the row's own surface scrolls.
+          // edit button. Each owns its click; only the row's own surface responds.
           if ((event.target as HTMLElement).closest('button, a, input, select, textarea')) return;
-          onRowClick();
+          onRowClick(event);
         })}
-        className={`group relative p-3 md:p-3.5 rounded-xl border shadow-2xs transition-all duration-200 ${bgStyle} hover:shadow-md hover:-translate-y-0.5 hover:border-[var(--color-primary)] space-y-2 ${isJustLinked ? 'otz-just-linked' : ''} ${onRowClick ? 'cursor-pointer' : ''}`}
+        className={`group relative p-3 md:p-3.5 rounded-xl border shadow-2xs transition-all duration-200 ${bgStyle} hover:shadow-md hover:-translate-y-0.5 hover:border-[var(--color-primary)] space-y-2 ${isJustLinked ? 'otz-just-linked' : ''} ${pointerCursor ? 'cursor-pointer' : ''} ${isSelected ? 'ring-2 ring-[var(--color-primary)]' : ''}`}
       >
         {/* Top Indicators */}
         <div className="flex flex-wrap items-center justify-between gap-1.5 text-xs text-[var(--color-on-surface-variant)]">
@@ -974,7 +1162,7 @@ export const EditMode: React.FC<EditModeProps> = ({
               {...drag.getHandleProps(lineIdx1)}
               aria-haspopup="listbox"
               aria-label={`שינוי הקישור של שורה ${lineIdx1}: גרור אל שורת מקור, או הקש Enter לבחירה מרשימה`}
-              title="גרור כדי לקשר לשורת מקור אחרת (או לחץ / Enter לבחירה מרשימה)"
+              title={`גרור כדי לקשר לשורת מקור אחרת (או לחץ / Enter לבחירה מרשימה)${bulkNote}`}
               className="inline-flex items-center justify-center w-8 h-8 -my-1 -mr-1.5 rounded-md text-[var(--color-on-surface-variant)] opacity-60 group-hover:opacity-100 focus-visible:opacity-100 cursor-grab active:cursor-grabbing hover:bg-[var(--color-secondary-subtle)] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--color-primary)] transition-opacity"
             >
               <GripVertical className="w-4 h-4 pointer-events-none" />
@@ -984,11 +1172,12 @@ export const EditMode: React.FC<EditModeProps> = ({
               <span
                 className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-[var(--color-primary)] text-[var(--color-on-primary)] text-[10px] font-bold"
                 title={
-                  isPendingInheritance
+                  (isPendingInheritance
                     ? `שורה זו ממשיכה את שורה ${pendingHead}, שטרם נמצא לה מקור — ברגע שתקושר שורה ${pendingHead}, שורה זו תירש את הקישור ממנה`
                     : inheritanceParent
                       ? `שורה זו יורשת את הקישור משורה ${inheritanceParent} — שינוי הקישור של שורה ${inheritanceParent} יעדכן גם שורה זו`
-                      : 'שורה זו יורשת את הקישור משורה קודמת'
+                      : 'שורה זו יורשת את הקישור משורה קודמת')
+                  + (manualInheritSet.has(lineIdx1) ? ' (הוגדר ידנית)' : '')
                 }
               >
                 <Info className="w-3 h-3" />
@@ -1026,7 +1215,7 @@ export const EditMode: React.FC<EditModeProps> = ({
                     ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300 border-emerald-300'
                     : 'bg-amber-50 text-amber-800 dark:bg-amber-950/60 dark:text-amber-300 border-amber-300'
                 }`}
-                title={`${linkObj.confidence ?? 85}% ודאות · לחץ לשינוי סטטוס אישור הקישור`}
+                title={`${linkObj.confidence ?? 85}% ודאות · לחץ לשינוי סטטוס אישור הקישור${bulkNote}`}
               >
                 <CheckCircle2 className={`w-3 h-3 ${(linkObj.status === 'approved' || !linkObj.status) ? 'text-emerald-600 dark:text-emerald-400' : 'text-amber-500'}`} />
                 <span className="text-[10px] font-mono">
@@ -1038,6 +1227,28 @@ export const EditMode: React.FC<EditModeProps> = ({
 
           {/* Floating Actions */}
           <div className="opacity-90 group-hover:opacity-100 flex items-center gap-1 transition-opacity">
+            {/* Context inheritance — declare this line a continuation of the one above it, or
+                give it back a link of its own. Hidden where neither is possible. */}
+            {!isFrontMatter && canToggleInheritance && (
+              <button
+                type="button"
+                aria-pressed={isInherited}
+                onClick={() => handleToggleInheritance(lineIdx1)}
+                className={`inline-flex items-center justify-center w-7 h-7 rounded-lg transition-colors border ${
+                  isInherited
+                    ? 'bg-[var(--color-primary-subtle)] border-[var(--color-outline)] text-[var(--color-primary)]'
+                    : 'border-transparent hover:border-[var(--color-outline)] hover:bg-[var(--color-primary-subtle)] text-[var(--color-primary)]'
+                }`}
+                title={
+                  isInherited
+                    ? `בטל ירושת הקשר · השורה תחזיק בקישור הנוכחי בעצמה${bulkNote}`
+                    : `הגדר כירושת הקשר משורה ${inheritanceParent} · השורה תוותר על קישור משלה ותלך בעקבות שורה ${inheritanceParent}${bulkNote}`
+                }
+              >
+                <CornerRightUp className="w-3.5 h-3.5" />
+              </button>
+            )}
+
             {/* Cycle Top-K candidate button — only shown when multiple candidates exist */}
             {linkObj && linkObj.candidates && linkObj.candidates.length > 1 && (
               <button
@@ -1058,9 +1269,12 @@ export const EditMode: React.FC<EditModeProps> = ({
               onClick={() => setEditingCommLineIdx(lineIdx1)}
               className="inline-flex items-center justify-center w-7 h-7 hover:bg-[var(--color-primary-subtle)] text-[var(--color-primary)] rounded-lg transition-colors border border-transparent hover:border-[var(--color-outline)]"
               title={
-                inheritedFollowerCount > 0
-                  ? `ערוך קישור ידנית · ${inheritedFollowerCount} שורות שיורשות את ההקשר ממנה יתעדכנו יחד איתה`
-                  : 'ערוך קישור ידנית'
+                (isBulkAction
+                  ? `ערוך יחד את ${bulkTargets.length} השורות שנבחרו`
+                  : inheritedFollowerCount > 0
+                    ? `ערוך קישור ידנית · ${inheritedFollowerCount} שורות שיורשות את ההקשר ממנה יתעדכנו יחד איתה`
+                    : 'ערוך קישור ידנית')
+                + (selectable ? ' · Ctrl+קליק על שורות לעריכת כמה שורות יחד' : '')
               }
             >
               <Edit3 className="w-3.5 h-3.5" />
@@ -1071,9 +1285,11 @@ export const EditMode: React.FC<EditModeProps> = ({
                 onClick={() => handleSaveLink(lineIdx1, null)}
                 className="inline-flex items-center justify-center w-7 h-7 hover:bg-rose-100 dark:hover:bg-rose-950/60 text-rose-600 dark:text-rose-400 rounded-lg transition-colors border border-transparent hover:border-rose-200"
                 title={
-                  inheritedFollowerCount > 0
-                    ? `נתק קישור · ${inheritedFollowerCount} שורות שיורשות את ההקשר ממנה ינותקו אף הן`
-                    : 'נתק קישור'
+                  isBulkAction
+                    ? `נתק את ${bulkTargets.length} השורות שנבחרו`
+                    : inheritedFollowerCount > 0
+                      ? `נתק קישור · ${inheritedFollowerCount} שורות שיורשות את ההקשר ממנה ינותקו אף הן`
+                      : 'נתק קישור'
                 }
               >
                 <Link2Off className="w-3.5 h-3.5" />
@@ -1186,7 +1402,10 @@ export const EditMode: React.FC<EditModeProps> = ({
                   {/* Primary Commentary Lines (7 Cols) */}
                   <div className="md:col-span-7 space-y-1.5">
                     {group.links.map((linkObj, idx) => (
-                      renderCommentaryBox(linkObj, group.commIndices[idx])
+                      renderCommentaryBox(linkObj, group.commIndices[idx], {
+                        selectable: true,
+                        onRowClick: event => handleRowSelectClick(group.commIndices[idx], event)
+                      })
                     ))}
                   </div>
 
@@ -1296,7 +1515,10 @@ export const EditMode: React.FC<EditModeProps> = ({
                 <p className="text-xs text-[var(--color-on-surface-variant)] font-medium">
                   לחץ על השורה כדי לגלול אליה, או על כפתור העריכה כדי לקשר:
                 </p>
-                {unlinkedCommLines.map(un => renderCommentaryBox(undefined, un.lineIndex1, () => handleScrollToUnlinkedRow(un.lineIndex1)))}
+                {unlinkedCommLines.map(un => renderCommentaryBox(undefined, un.lineIndex1, {
+                  onRowClick: () => handleScrollToUnlinkedRow(un.lineIndex1),
+                  pointerCursor: true
+                }))}
               </div>
             )}
           </div>
@@ -1335,6 +1557,7 @@ export const EditMode: React.FC<EditModeProps> = ({
           tosafotLines={tosafotLines}
           targetBookName={config.targetBookName}
           isShas={config.sourceCategory === 'shas'}
+          bulkLineCount={actionTargets(editingCommLineIdx).length}
           onSave={handleSaveLink}
           onClose={() => setEditingCommLineIdx(null)}
         />

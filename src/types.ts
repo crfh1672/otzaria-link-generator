@@ -74,6 +74,12 @@ export interface SessionState {
   rashiLines?: string[];          // Secondary Rashi lines (if Shas)
   tosafotLines?: string[];        // Secondary Tosafot lines (if Shas)
   dhHighlights?: Record<number, DHHighlight>; // line_index_1 -> word highlights
+  /**
+   * Commentary lines (1-based) the user declared by hand as continuing the line above them —
+   * the same statement a בא"ד line makes in its own text. Kept outside `links` because such a
+   * line may well have no link of its own yet (see src/utils/inheritanceChain.ts).
+   */
+  manualInheritLines?: number[];
   lastModifiedTimestamp: number;
 }
 

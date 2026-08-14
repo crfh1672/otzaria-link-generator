@@ -29,7 +29,15 @@ import {
  * the בא"ד line waits for its predecessor, and the moment that predecessor is linked it
  * inherits the target automatically. Inheritance is never carried over a line that found no
  * source to some earlier linked line; it only ever comes from the line directly above.
+ *
+ * The user can declare that same continuation by hand on a line whose text does not say בא"ד
+ * (`manualInherit`, stored as `SessionState.manualInheritLines`). Such a line is treated exactly
+ * like a בא"ד line everywhere below — including across a header — so a hand-marked chain behaves
+ * identically to one the parser derived.
  */
+
+/** Lines the user marked by hand as continuing the line above them. */
+export type ManualInheritLines = ReadonlySet<number> | undefined;
 
 /**
  * Whether a commentary line opens with an explicit בא"ד/א"ד reference, i.e. states in the text
@@ -38,6 +46,39 @@ import {
  */
 export function hasExplicitBaadMarker(commentaryLine: string): boolean {
   return isBaadContinuationLine(commentaryLine);
+}
+
+/**
+ * Whether the line states — in its own text or by the user's hand — that it continues the line
+ * above it. The single place the two sources of the same statement are merged.
+ */
+export function continuesLineAbove(
+  lineIdx1: number,
+  rawLine: string,
+  manualInherit?: ManualInheritLines
+): boolean {
+  return hasExplicitBaadMarker(rawLine) || Boolean(manualInherit?.has(lineIdx1));
+}
+
+/**
+ * `firstContentLineIsBaad` widened to hand-marked lines: whether the first content line at or
+ * after `fromLineIdx1` continues the line above it, and therefore carries the chain over the
+ * header(s) sitting in front of it.
+ */
+function firstContentLineContinues(
+  commentaryLines: string[],
+  fromLineIdx1: number,
+  manualInherit?: ManualInheritLines
+): boolean {
+  if (!manualInherit || manualInherit.size === 0) {
+    return firstContentLineIsBaad(commentaryLines, fromLineIdx1);
+  }
+  for (let i = Math.max(1, fromLineIdx1); i <= commentaryLines.length; i++) {
+    const raw = commentaryLines[i - 1] ?? '';
+    if (!raw.trim() || isHeaderLine(raw)) continue;
+    return continuesLineAbove(i, raw, manualInherit);
+  }
+  return false;
 }
 
 /**
@@ -51,7 +92,8 @@ export function hasExplicitBaadMarker(commentaryLine: string): boolean {
 export function collectInheritedFollowers(
   parentLineIdx1: number,
   links: OtzariaLink[],
-  commentaryLines: string[]
+  commentaryLines: string[],
+  manualInherit?: ManualInheritLines
 ): number[] {
   const followers: number[] = [];
   const linkByLine = new Map(links.map(l => [l.line_index_1, l]));
@@ -61,7 +103,7 @@ export function collectInheritedFollowers(
     // A header ends the chain unless the segment it opens starts with a בא"ד line, which
     // continues this chain across it.
     if (isHeaderLine(raw)) {
-      if (!firstContentLineIsBaad(commentaryLines, lineIdx1 + 1)) break;
+      if (!firstContentLineContinues(commentaryLines, lineIdx1 + 1, manualInherit)) break;
       continue;
     }
     if (!raw.trim()) continue;
@@ -74,7 +116,7 @@ export function collectInheritedFollowers(
 
     if (link) {
       if (!link.isInherited) break;
-    } else if (!hasExplicitBaadMarker(raw)) {
+    } else if (!continuesLineAbove(lineIdx1, raw, manualInherit)) {
       break;
     }
 
@@ -92,7 +134,8 @@ export function collectInheritedFollowers(
 export function findInheritanceParent(
   lineIdx1: number,
   links: OtzariaLink[],
-  commentaryLines: string[]
+  commentaryLines: string[],
+  manualInherit?: ManualInheritLines
 ): number | null {
   const linkByLine = new Map(links.map(l => [l.line_index_1, l]));
 
@@ -102,7 +145,7 @@ export function findInheritanceParent(
     // line that opens the segment below it says בא"ד — then the chain runs through the header
     // and its head is somewhere in the segment above.
     if (isHeaderLine(raw)) {
-      if (!firstContentLineIsBaad(commentaryLines, cursor + 1)) return null;
+      if (!firstContentLineContinues(commentaryLines, cursor + 1, manualInherit)) return null;
       continue;
     }
     if (!raw.trim()) continue;
@@ -120,7 +163,7 @@ export function findInheritanceParent(
     }
     // No link: a בא"ד line is a chain member waiting like this one, anything else is the
     // unresolved head the chain hangs from.
-    if (!hasExplicitBaadMarker(raw)) return cursor;
+    if (!continuesLineAbove(cursor, raw, manualInherit)) return cursor;
   }
 
   return null;
@@ -137,12 +180,13 @@ export function findInheritanceParent(
 export function findPendingInheritanceHead(
   lineIdx1: number,
   links: OtzariaLink[],
-  commentaryLines: string[]
+  commentaryLines: string[],
+  manualInherit?: ManualInheritLines
 ): number | null {
   if (links.some(l => l.line_index_1 === lineIdx1)) return null;
-  if (!hasExplicitBaadMarker(commentaryLines[lineIdx1 - 1] ?? '')) return null;
+  if (!continuesLineAbove(lineIdx1, commentaryLines[lineIdx1 - 1] ?? '', manualInherit)) return null;
 
-  const head = findInheritanceParent(lineIdx1, links, commentaryLines);
+  const head = findInheritanceParent(lineIdx1, links, commentaryLines, manualInherit);
   if (head === null) return null;
 
   return links.some(l => l.line_index_1 === head) ? null : head;
@@ -166,6 +210,7 @@ export function cascadeInheritedContext(params: {
   rashiLines?: string[];
   tosafotLines?: string[];
   dhHighlights?: Record<number, DHHighlight>;
+  manualInherit?: ManualInheritLines;
 }): OtzariaLink[] {
   const {
     links,
@@ -174,10 +219,11 @@ export function cascadeInheritedContext(params: {
     sourceLines = [],
     rashiLines = [],
     tosafotLines = [],
-    dhHighlights = {}
+    dhHighlights = {},
+    manualInherit
   } = params;
 
-  const followers = collectInheritedFollowers(parentLineIdx1, links, commentaryLines);
+  const followers = collectInheritedFollowers(parentLineIdx1, links, commentaryLines, manualInherit);
   if (followers.length === 0) return links;
 
   const followerLines = new Set(followers);
@@ -246,4 +292,67 @@ export function cascadeInheritedContext(params: {
   const created = followers.filter(lineIdx1 => !linkByLine.has(lineIdx1)).map(lineIdx1 => inherit(lineIdx1));
 
   return [...updated, ...created];
+}
+
+/**
+ * Declare by hand that `lineIdx1` continues the line above it, exactly as a בא"ד line does:
+ * the line gives up any target of its own and takes the one its chain head holds. When the head
+ * has no target yet the line joins it in waiting, and is linked the moment the head is.
+ *
+ * Returns null — leaving the session untouched — when there is no line above it to continue:
+ * `lineIdx1` opens its segment, or everything above it is out of the chain's reach.
+ */
+export function markLineAsInherited(params: {
+  links: OtzariaLink[];
+  commentaryLines: string[];
+  lineIdx1: number;
+  manualInherit: ManualInheritLines;
+  sourceLines?: string[];
+  rashiLines?: string[];
+  tosafotLines?: string[];
+  dhHighlights?: Record<number, DHHighlight>;
+}): { links: OtzariaLink[]; manualInherit: Set<number> } | null {
+  const { links, commentaryLines, lineIdx1, manualInherit, ...targets } = params;
+
+  const nextManual = new Set(manualInherit ?? []);
+  nextManual.add(lineIdx1);
+
+  const head = findInheritanceParent(lineIdx1, links, commentaryLines, nextManual);
+  if (head === null) return null;
+
+  // The line has to stop owning its target before the cascade runs: the walk down from the head
+  // stops at the first line that owns one, and that line would be this one.
+  const released = links.map(l => (l.line_index_1 === lineIdx1 ? { ...l, isInherited: true } : l));
+
+  return {
+    links: cascadeInheritedContext({
+      ...targets,
+      links: released,
+      commentaryLines,
+      parentLineIdx1: head,
+      manualInherit: nextManual
+    }),
+    manualInherit: nextManual
+  };
+}
+
+/**
+ * The reverse: the line keeps the target it was given but owns it from now on, becoming the head
+ * of the chain that used to run through it. Lines below it inherit the very same target, so
+ * nothing about them changes.
+ */
+export function unmarkLineAsInherited(params: {
+  links: OtzariaLink[];
+  lineIdx1: number;
+  manualInherit: ManualInheritLines;
+}): { links: OtzariaLink[]; manualInherit: Set<number> } {
+  const { links, lineIdx1, manualInherit } = params;
+
+  const nextManual = new Set(manualInherit ?? []);
+  nextManual.delete(lineIdx1);
+
+  return {
+    links: links.map(l => (l.line_index_1 === lineIdx1 ? { ...l, isInherited: false } : l)),
+    manualInherit: nextManual
+  };
 }

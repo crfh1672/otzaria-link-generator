@@ -14,6 +14,11 @@ interface EditLinkModalProps {
   tosafotLines?: string[];
   targetBookName?: string;
   isShas: boolean;
+  /**
+   * How many commentary lines the save will land on. Above 1 the user picked a run of rows in the
+   * list and every one of them takes the target chosen here; the modal itself works the same.
+   */
+  bulkLineCount?: number;
   onSave: (commLineIndex: number, newSourceLineIdx: number | null, secondaryTarget?: 'rashi' | 'tosafot') => void;
   onClose: () => void;
 }
@@ -29,9 +34,11 @@ export const EditLinkModal: React.FC<EditLinkModalProps> = ({
   tosafotLines = [],
   targetBookName = 'גמרא',
   isShas,
+  bulkLineCount = 1,
   onSave,
   onClose,
 }) => {
+  const isBulk = bulkLineCount > 1;
   // Determine initial active tab and line index
   const initialTab = currentLink?.secondaryTarget || 'primary';
   const initialLineIdx = currentLink?.secondaryTarget
@@ -176,7 +183,11 @@ export const EditLinkModal: React.FC<EditLinkModalProps> = ({
           <div className="flex items-center justify-between gap-2">
             <div className="flex items-center gap-2 text-[var(--color-on-surface)] font-bold text-sm md:text-base min-w-0">
               <ArrowLeftRight className="w-5 h-5 text-[var(--color-primary)] shrink-0" />
-              <span className="truncate">עריכת קישור שורת פירוש #{commLineIndex}</span>
+              <span className="truncate">
+                {isBulk
+                  ? `עריכת ${bulkLineCount} שורות פירוש שנבחרו`
+                  : `עריכת קישור שורת פירוש #${commLineIndex}`}
+              </span>
             </div>
             <button
               onClick={onClose}
@@ -194,7 +205,7 @@ export const EditLinkModal: React.FC<EditLinkModalProps> = ({
             className="w-full flex items-start gap-2 text-right bg-[var(--color-surface)] px-3 py-2 rounded-xl border border-[var(--color-outline-variant)] hover:border-[var(--color-primary)] transition-colors cursor-pointer"
           >
             <span className="shrink-0 text-[10px] font-mono font-bold text-[var(--color-primary)] bg-[var(--color-primary-subtle)] px-1.5 py-0.5 rounded-md mt-px">
-              שורה {commLineIndex}
+              {isBulk ? `שורה ${commLineIndex} ועוד ${bulkLineCount - 1}` : `שורה ${commLineIndex}`}
             </span>
             <p className={`flex-1 min-w-0 text-xs md:text-sm font-sans leading-relaxed text-[var(--color-on-surface)] font-medium ${isCommExpanded ? 'max-h-24 overflow-y-auto' : 'truncate'}`}>
               {commLineText}
@@ -439,7 +450,7 @@ export const EditLinkModal: React.FC<EditLinkModalProps> = ({
             className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-bold text-rose-600 dark:text-rose-400 hover:bg-rose-50 dark:hover:bg-rose-950/40 rounded-xl border border-rose-200 dark:border-rose-900 transition-colors cursor-pointer"
           >
             <Trash2 className="w-4 h-4" />
-            <span>מחק קישור</span>
+            <span>{isBulk ? `מחק ${bulkLineCount} קישורים` : 'מחק קישור'}</span>
           </button>
 
           <div className="flex items-center gap-2">
