@@ -1,5 +1,5 @@
-import { OtzariaLink, PluginConfig, DHHighlight } from '../types';
-import { expandAbbreviationsInText, DEFAULT_ABBREVIATIONS, NORMALIZED_ABBREVIATIONS_MAP, ABBR_MARK } from '../data/abbreviations';
+import { OtzariaLink, PluginConfig, DHHighlight } from '../../src/types';
+import { expandAbbreviationsInText, DEFAULT_ABBREVIATIONS, NORMALIZED_ABBREVIATIONS_MAP, ABBR_MARK } from '../../src/data/abbreviations';
 
 /**
  * FIX ח׳ — a resolved abbreviation keeps ONE slot of the maxDhWords cap and bridges the run,
@@ -8,8 +8,78 @@ import { expandAbbreviationsInText, DEFAULT_ABBREVIATIONS, NORMALIZED_ABBREVIATI
  * (globally capped, 1.5) acceptance bar keeps its meaning.
  */
 const ABBR_DAMP = 0.6;
-import { getWordSimilarity, getNikudFingerprint, levenshteinDistance } from './fuzzyUtils';
-import { getCombinedWordWeight, calculateDocumentIdfWeights, HEBREW_STOP_WORDS } from './wordWeights';
+import { getWordSimilarity, getNikudFingerprint, levenshteinDistance } from '../../src/utils/fuzzyUtils';
+import { getCombinedWordWeight, calculateDocumentIdfWeights, HEBREW_STOP_WORDS } from '../../src/utils/wordWeights';
+
+/**
+ * ═══════════════════════════════════════════════════════════════════════════════════════════
+ * SIMULATION ONLY — "עוגן מילה ראשונה" (single-word first-word anchor).
+ *
+ * OFF unless process.env.SWDH === '1'. With the flag off this file is byte-for-byte the
+ * production parser (verified by running both and diffing the dumps), so the same binary
+ * produces both sides of the comparison.
+ *
+ * WHY: the acceptance bar in computeDynamicMinThreshold is `Math.min(1.5, …)`, while a single
+ * word can contribute at most MAX_WORD_WEIGHT = 1.30. A one-word Dibur Hamatchil therefore
+ * cannot clear the bar under ANY configuration — it is arithmetically unreachable, not merely
+ * unlikely. This fallback is the only path that can produce such a link.
+ *
+ * WHEN IT FIRES — all of:
+ *   1. the ordinary search (plus the whole flexibility ladder) returned nothing, AND
+ *   2. the line is not a בא"ד / שם-ibid continuation (those mean "same place as above" by
+ *      their own words — there is no quote to anchor), AND
+ *   3. it runs BEFORE both inheritance paths, so it can also override a link the line would
+ *      otherwise have inherited.
+ *
+ * THE RULE:
+ *   • anchor = the FIRST word of the commentary line's DH text (after the routing prefix
+ *     רש"י / תוס' / גמ' is stripped — that names the target, it is not part of the quote).
+ *   • matched WITHOUT prefix-letter stripping and WITHOUT any flexibility: plain string
+ *     equality on the normalised form (nikud, quotes and punctuation removed — normalisation,
+ *     not fuzziness). No stems, no Levenshtein, no ktiv variants, no ו/ב/כ/ל/מ/ש/ה peeling.
+ *   • gate: the anchor may open at most SWDH_MAX_OPENING_RATIO of the commentary book's own
+ *     content lines. A word the commentator habitually opens with (והנה, ובזה, אמנם) is his
+ *     discourse, not a lemma; a word that opens 0.1% of his lines is a quotation.
+ *   • search scope: the aligned target segment (the daf) of the routed document, exactly the
+ *     range the ordinary search used.
+ *   • where in the target line: at the START of the line for רש"י / תוספות (their lines open
+ *     with the lemma being explained — the same requireStartAtFirstWord rule the ordinary
+ *     secondary search uses), ANYWHERE in the line for the גמרא.
+ *   • tie-break when several lines qualify: the first candidate at or after the previously
+ *     matched target line (the engine's usual forward progression), else the first in the
+ *     segment. Every fired link records how many candidates there were.
+ * ═══════════════════════════════════════════════════════════════════════════════════════════
+ */
+const SWDH_ON = process.env.SWDH === '1';
+/** Anchor may open at most this share of the commentary book's content lines. */
+const SWDH_MAX_OPENING_RATIO = Number(process.env.SWDH_RATIO ?? 0.02);
+/** Anchor must be at least this many letters (a 1–2 letter token carries no evidence). */
+const SWDH_MIN_LETTERS = 3;
+/**
+ * Uniqueness inside the parallel daf (SWDH_UNIQUE=1).
+ *
+ * The rarity gate above is a property of the COMMENTARY — it establishes that the word is not
+ * the author's own discourse. It says nothing about whether the word identifies ONE line in
+ * the target. When several lines of the daf carry it, picking one is a guess dressed as a
+ * match, and the forward-progression tie-break has no evidence behind it. With this on, the
+ * anchor must single out exactly one line of the daf or it does not fire at all.
+ */
+const SWDH_REQUIRE_UNIQUE = process.env.SWDH_UNIQUE === '1';
+
+/** Per-run trace of every line the fallback fired on — read by the QA dump script. */
+export interface SwdhFire {
+  cLine: number;
+  anchor: string;
+  targetDoc: 'rashi' | 'tosafot' | 'primary';
+  targetLine: number;
+  candidates: number;
+  openingRatio: number;
+  /** The line already held an inherited link that this fallback replaced. */
+  overrodeInheritance: boolean;
+}
+export const SWDH_TRACE: SwdhFire[] = [];
+export const SWDH_REJECTS: Record<string, number> = {};
+const swdhReject = (why: string) => { SWDH_REJECTS[why] = (SWDH_REJECTS[why] || 0) + 1; };
 
 /**
  * Anchor policy for the TARGET-document side of the matcher (see calcContiguousScore and
@@ -45,53 +115,6 @@ import { getCombinedWordWeight, calculateDocumentIdfWeights, HEBREW_STOP_WORDS }
  */
 const SHALLOW_ANCHOR_LIMIT = 3;
 const DEEP_ANCHOR_MIN_RUN = 3;
-
-/**
- * ── Single-word Dibur Hamatchil: the first-word anchor ────────────────────────────────────
- *
- * A one-word ד"ה could never produce a link, and not because it was judged weak: the
- * acceptance bar is `Math.min(1.5, …)` (computeDynamicMinThreshold) while a single word is
- * worth at most 1.30 (getCombinedWordWeight's ceiling, CONF.MAX_WORD_WEIGHT). 1.30 < 1.5 under
- * every configuration, so the case was arithmetically unreachable rather than merely unlikely.
- * The ordinary scorer cannot be relaxed to admit it — lowering the bar to 1.3 would admit every
- * incidental one-word coincidence in the book. It needs its own evidence instead.
- *
- * WHEN — all of:
- *   1. nothing was found: not by the strict search, not by any rung (A–D) of the flexibility
- *      ladder, and not in the secondary document;
- *   2. the line is not a בא"ד / שם-ibid continuation — those say "same place as above" in their
- *      own words, so there is no quote to anchor;
- *   3. it runs BEFORE both inheritance paths, so a line that would have silently inherited gets
- *      a real anchor instead.
- *
- * THE RULE — the anchor is the FIRST word of the ד"ה (after stripSecondaryPrefix removes the
- * routing label רש"י / תוס' / גמ' / שם, which names the target and is not part of the quote),
- * matched by PLAIN STRING EQUALITY on the normalised form. No prefix-letter (אותיות שימוש)
- * stripping, no Levenshtein, no stems, no ktiv variants — normalizeText removes nikud, quotes
- * and punctuation, and nothing else is forgiven. One word is too little evidence to spend any
- * of it on fuzziness.
- *
- * TWO GATES, one on each side of the match:
- *   • RARITY (commentary side) — the word may open at most SWDH_MAX_OPENING_RATIO of this
- *     commentator's own content lines. A word he habitually opens with (והנה, ובזה, אמנם) is
- *     his discourse, not a lemma. Measured over the book being processed, so it adapts to the
- *     author rather than to a fixed list.
- *   • UNIQUENESS (target side) — the word must occur in exactly ONE line of the parallel daf.
- *     Rarity establishes that the word is quotable; it says nothing about which line it points
- *     at. With several candidates, choosing one is a guess wearing a match's clothes.
- *
- * Search scope is the aligned segment only. In רש"י / תוספות the word must be the line's FIRST
- * word (their lines open with the lemma — the same rule requireStartAtFirstWord applies to the
- * ordinary secondary search); in the גמרא it may sit anywhere in the line.
- *
- * Measured over three full books (פני יהושע on ברכות and on שבת, בן יהוידע on ברכות): 19 links
- * that no configuration of the engine could previously produce, no line lost a link, and of the
- * cases an independent judge could rule on, it picked the same line every time. See
- * docs/SIMULATION_SINGLE_WORD_DH.md and qa/variant/ for the simulation this was derived from.
- */
-const SWDH_MAX_OPENING_RATIO = 0.008;
-/** Anchor must have at least this many letters — a 1–2 letter token carries no evidence. */
-const SWDH_MIN_LETTERS = 3;
 
 /**
  * How many words of a post-כו' continuation segment are considered.
@@ -1977,24 +2000,29 @@ export function runLinkingParser(
   const dhHighlights: Record<number, DHHighlight> = {};
 
   /**
-   * How often this commentator OPENS a line with each word — the denominator of the first-word
-   * anchor's rarity gate (see SWDH_MAX_OPENING_RATIO). Derived exactly the way the anchor
-   * itself is, so numerator and denominator measure the same quantity: once over one line,
-   * once over the book.
+   * SWDH — how often the commentator OPENS a line with each word, over his whole book.
+   * The denominator of the ≤2% gate. Derived exactly the way the anchor itself is derived
+   * (routing prefix stripped, then normalised), so numerator and denominator are the same
+   * quantity measured over one line and over the book.
    */
   const swdhOpeningCount = new Map<string, number>();
   let swdhContentLines = 0;
-  for (const raw of commDoc.lines) {
-    if (!raw || !raw.trim() || isHeaderLine(raw)) continue;
-    swdhContentLines++;
-    const t = raw.trim();
-    const stripped = stripSecondaryPrefix(t);
-    const first = normalizeText(stripped.trim() ? stripped : t).split(/\s+/).filter(Boolean)[0];
-    if (first) swdhOpeningCount.set(first, (swdhOpeningCount.get(first) || 0) + 1);
+  if (SWDH_ON) {
+    for (const raw of commDoc.lines) {
+      if (!raw || !raw.trim() || isHeaderLine(raw)) continue;
+      swdhContentLines++;
+      const t = raw.trim();
+      const stripped = stripSecondaryPrefix(t);
+      const norm = normalizeText(stripped.trim() ? stripped : t);
+      const first = norm.split(/\s+/).filter(Boolean)[0];
+      if (first) swdhOpeningCount.set(first, (swdhOpeningCount.get(first) || 0) + 1);
+    }
   }
-  /** Share of the commentary's content lines this word opens. 1 (i.e. "always") if unknown. */
   const swdhOpeningRatio = (w: string): number =>
     swdhContentLines > 0 ? (swdhOpeningCount.get(w) || 0) / swdhContentLines : 1;
+
+  /** Letters only — the gate on anchor length ignores quotes/geresh/nikud. */
+  const swdhLetters = (w: string): string => w.replace(/[^א-ת]/g, '');
 
   // Map source header segments to commentary header segments
   let previousSecondaryType: 'rashi' | 'tosafot' | null = null;
@@ -2401,10 +2429,12 @@ export function runLinkingParser(
         }
       }
 
-      // ── Single-word Dibur Hamatchil: the first-word anchor ───────────────────────────────
-      // Last resort before inheritance. Fires only when NOTHING was found above — see the
-      // policy note at the top of this file for what it does and why it has to exist.
-      if (!matchedSourceLineNum && !matchedSecondaryLineNum && !shouldInheritLine) {
+      // ── SWDH: single-word first-word anchor ──────────────────────────────────────────────
+      // Fires only when NOTHING was found above (neither document, neither the strict search
+      // nor any rung of the flexibility ladder), and only on lines that are not self-declared
+      // continuations. Sits here, ahead of both inheritance blocks below, so a line that would
+      // have silently inherited gets a real anchor instead.
+      if (SWDH_ON && !matchedSourceLineNum && !matchedSecondaryLineNum && !shouldInheritLine) {
         const swTargetDoc: 'rashi' | 'tosafot' | 'primary' =
           targetSecondary === 'rashi' ? 'rashi' : targetSecondary === 'tosafot' ? 'tosafot' : 'primary';
         const swDocLines =
@@ -2414,64 +2444,86 @@ export function runLinkingParser(
         const swSeg = swTargetDoc === 'rashi' ? rashiSeg : swTargetDoc === 'tosafot' ? tosafotSeg : srcSeg;
         const swIdf = swTargetDoc === 'rashi' ? rashiIdfMap : swTargetDoc === 'tosafot' ? tosafotIdfMap : srcIdfMap;
 
-        // The anchor: first word of the ד"ה, exactly as written — no prefix letters removed.
+        // The anchor: FIRST word of the DH text. No prefix-letter stripping — the word is
+        // taken exactly as the commentator wrote it.
         const swWords = (cleanDh || normalizeText(lineForDhExtraction)).split(/\s+/).filter(Boolean);
         const anchor = swWords[0] || '';
-        const anchorLetters = anchor.replace(/[^א-ת]/g, '');
+        const anchorLetters = swdhLetters(anchor);
+        const ratio = swdhOpeningRatio(anchor);
 
-        if (
-          anchorLetters.length >= SWDH_MIN_LETTERS &&
-          !HEBREW_STOP_WORDS.has(anchorLetters) &&
-          swdhOpeningRatio(anchor) <= SWDH_MAX_OPENING_RATIO &&
-          swDocLines && swSeg
-        ) {
-          // Plain string equality on the normalised form. Nothing else.
+        if (!anchor) {
+          swdhReject('אין מילה');
+        } else if (anchorLetters.length < SWDH_MIN_LETTERS) {
+          swdhReject('מילה קצרה מדי');
+        } else if (HEBREW_STOP_WORDS.has(anchorLetters)) {
+          swdhReject('מילת עצירה');
+        } else if (ratio > SWDH_MAX_OPENING_RATIO) {
+          swdhReject('שכיחה בתחילות שורה');
+        } else if (!swDocLines || !swSeg) {
+          swdhReject('אין סגמנט יעד');
+        } else {
+          // Exact string equality on the normalised form. Nothing else.
+          const from = swSeg.startLine;
           const to = Math.min(swSeg.endLine, swDocLines.length);
-          let hit = 0;
-          let hits = 0;
-          for (let l = swSeg.startLine; l <= to; l++) {
+          const hits: number[] = [];
+          for (let l = from; l <= to; l++) {
             const words = swCache?.[l - 1]?.words;
             if (!words || words.length === 0) continue;
-            if (swTargetDoc === 'primary' ? words.includes(anchor) : words[0] === anchor) {
-              hits++;
-              if (hits === 1) hit = l;
-              else break; // a second hit already disqualifies the anchor
-            }
+            if (swTargetDoc === 'primary' ? words.includes(anchor) : words[0] === anchor) hits.push(l);
           }
 
-          if (hits === 1) {
+          if (hits.length === 0) {
+            swdhReject('העוגן לא בדף');
+          } else if (SWDH_REQUIRE_UNIQUE && hits.length > 1) {
+            swdhReject(`מופיע ${hits.length > 4 ? '5+' : hits.length} פעמים בדף`);
+          } else {
+            // Forward progression: first candidate at or after the last target already used.
+            const prevTgt = swTargetDoc === 'primary'
+              ? (lastMatchedSrcLineIndex ?? 0)
+              : (prevSecondaryLineNum ?? 0);
+            const chosen = hits.find(l => l >= prevTgt) ?? hits[0];
+
             const anchorWeight = getCombinedWordWeight(anchor, enableWordWeighting, swIdf);
             const windowWeight = swWords
-              .slice(0, maxDhWordsForTarget)
+              .slice(0, targetSecondary === 'tosafot' ? 7 : 12)
               .reduce((s, w) => s + getCombinedWordWeight(w, enableWordWeighting, swIdf), 0);
             const swResult: SearchResult = {
-              lineNum: hit,
+              lineNum: chosen,
               matchedCount: 1,
               matchedWordCount: 1,
               expectedWeight: windowWeight,
-              topK: [{ lineNum: hit, score: anchorWeight }],
+              topK: hits.slice(0, 3).map(l => ({ lineNum: l, score: anchorWeight })),
               evidence: {
                 matchedWeight: anchorWeight,
                 windowWeight: windowWeight || anchorWeight,
                 runWords: 1,
                 simSum: 1,
                 winnerScore: anchorWeight,
-                // Uniqueness is enforced above, so there is no rival by construction.
-                runnerUpScore: 0,
-                // One word is not a phrase; claiming a verbatim phrase match here would
-                // inflate the reported confidence of the thinnest evidence the engine accepts.
+                // Several qualifying lines means the CHOICE is unsupported — reported as a
+                // zero margin, which is what drags a multi-candidate fallback's confidence down.
+                runnerUpScore: hits.length > 1 ? anchorWeight : 0,
                 exactPhrase: false
               }
             };
-            if (DEBUG) console.log(`  ⚓ First-word anchor '${anchor}' → ${swTargetDoc} line ${hit}`);
+
+            SWDH_TRACE.push({
+              cLine: cLineIdx, anchor, targetDoc: swTargetDoc, targetLine: chosen,
+              candidates: hits.length, openingRatio: ratio,
+              // Exactly the condition of the fallback-inheritance block below: had the anchor
+              // not fired, would this line have taken the previous link's target?
+              overrodeInheritance: !explicitSecondaryTarget && !explicitPrimaryTarget
+                && !(isJustSham && !shamShouldInherit)
+                && Boolean(previousLink && previousLink.line_index_2)
+            });
+            swdhReject('FIRED');
 
             if (swTargetDoc === 'primary') {
               srcMatchRes = swResult;
-              matchedSourceLineNum = hit;
+              matchedSourceLineNum = chosen;
             } else {
               secMatchRes = swResult;
-              matchedSecondaryLineNum = hit;
-              matchedSourceLineNum = hit;
+              matchedSecondaryLineNum = chosen;
+              matchedSourceLineNum = chosen;
             }
           }
         }
@@ -2625,7 +2677,7 @@ export function runLinkingParser(
           };
         };
 
-        const linkCandidates: import('../types').LinkCandidate[] = rawTopK.map((c, i) => ({
+        const linkCandidates: import('../../src/types').LinkCandidate[] = rawTopK.map((c, i) => ({
           lineNum: c.lineNum,
           score: c.score,
           confidence: calculateLinkConfidence({
