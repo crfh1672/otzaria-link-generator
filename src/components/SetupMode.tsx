@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import { BookNode, PluginConfig, TANAKH_BOOKS, SHAS_TRACTATES } from '../types';
+import { BookNode, PluginConfig, TANAKH_BOOKS, SHAS_TRACTATES, HALACHA_BOOKS } from '../types';
 import { MOCK_LIBRARY_TREE } from '../data/otzariaLibraryMock';
 import { fetchLibraryTree, fetchBookContent, fetchBookLinks, notifyError, notifySuccess, saveToCache, getFromCache, removeFromCache } from '../utils/otzariaBridge';
 import { loadGsDictionary } from '../utils/gsDictionary';
@@ -53,10 +53,18 @@ export const SetupMode: React.FC<SetupModeProps> = ({ onRunAlgorithm }) => {
   });
 
   // Config State
-  const [category, setCategory] = useState<'tanakh' | 'shas'>('tanakh');
+  const [category, setCategory] = useState<'tanakh' | 'shas' | 'halacha'>('tanakh');
   const [targetBook, setTargetBook] = useState<string>(TANAKH_BOOKS[0]);
   const [ignoreShamInShas, setIgnoreShamInShas] = useState<boolean>(true);
   const [delimiter, setDelimiter] = useState<string>('');
+
+  /**
+   * מבנה הקטעים בספר הלכה — שתי שאלות שרק המשתמש יודע את תשובתן, וממנה נגזרת כל מדיניות
+   * השורות של הריצה (ראו halachaModeFromConfig ב-src/utils/halachaAlgorithm.ts).
+   * השאלה השנייה תלויה בראשונה: בלי קטעים רב-שורתיים אין ס"ק ואין ירושת הקשר.
+   */
+  const [halachaMultiLinePieces, setHalachaMultiLinePieces] = useState<boolean>(true);
+  const [halachaSeifKatan, setHalachaSeifKatan] = useState<boolean>(true);
 
   // Rashei Teivot (Abbreviations) & Fuzzy Matching State
   const [useAbbreviationExpansion, setUseAbbreviationExpansion] = useState<boolean>(true);
@@ -70,16 +78,15 @@ export const SetupMode: React.FC<SetupModeProps> = ({ onRunAlgorithm }) => {
 
   const [isProcessing, setIsProcessing] = useState(false);
 
+  /** ספרי המקור שהקטגוריה מציעה — מקור אמת יחיד לרשימה ולאיפוס הבחירה כשהקטגוריה מתחלפת. */
+  const booksForCategory = (c: 'tanakh' | 'shas' | 'halacha') =>
+    c === 'tanakh' ? TANAKH_BOOKS : c === 'shas' ? SHAS_TRACTATES : HALACHA_BOOKS;
+
   // Update default target book when category changes
   useEffect(() => {
-    if (category === 'tanakh') {
-      if (!TANAKH_BOOKS.includes(targetBook)) {
-        setTargetBook(TANAKH_BOOKS[0]);
-      }
-    } else {
-      if (!SHAS_TRACTATES.includes(targetBook)) {
-        setTargetBook(SHAS_TRACTATES[0]);
-      }
+    const books = booksForCategory(category);
+    if (!books.includes(targetBook)) {
+      setTargetBook(books[0]);
     }
   }, [category]);
 
@@ -356,27 +363,31 @@ export const SetupMode: React.FC<SetupModeProps> = ({ onRunAlgorithm }) => {
       let rashiLinks: any[] = [];
       let tosafotLinks: any[] = [];
 
-      // Fetch secondary source files (Rashi and Tosafot for target book if available)
-      try {
-        const rashiVariants = getSecondaryBookVariants(targetBook, 'rashi');
-        const rashiResult = await tryFetchSecondarySource(rashiVariants);
-        if (rashiResult.text) {
-          rashiText = rashiResult.text;
-          rashiLinks = rashiResult.links;
+      // Fetch secondary source files (Rashi and Tosafot for target book if available).
+      // בקטגוריית הלכה אין מקורות משניים — הקישורים מצביעים על השו"ע עצמו בלבד — ולכן
+      // אין טעם לחפש "רש"י על שולחן ערוך" בספרייה.
+      if (category !== 'halacha') {
+        try {
+          const rashiVariants = getSecondaryBookVariants(targetBook, 'rashi');
+          const rashiResult = await tryFetchSecondarySource(rashiVariants);
+          if (rashiResult.text) {
+            rashiText = rashiResult.text;
+            rashiLinks = rashiResult.links;
+          }
+        } catch {
+          rashiText = undefined;
         }
-      } catch {
-        rashiText = undefined;
-      }
 
-      try {
-        const tosafotVariants = getSecondaryBookVariants(targetBook, 'tosafot');
-        const tosafotResult = await tryFetchSecondarySource(tosafotVariants);
-        if (tosafotResult.text) {
-          tosafotText = tosafotResult.text;
-          tosafotLinks = tosafotResult.links;
+        try {
+          const tosafotVariants = getSecondaryBookVariants(targetBook, 'tosafot');
+          const tosafotResult = await tryFetchSecondarySource(tosafotVariants);
+          if (tosafotResult.text) {
+            tosafotText = tosafotResult.text;
+            tosafotLinks = tosafotResult.links;
+          }
+        } catch {
+          tosafotText = undefined;
         }
-      } catch {
-        tosafotText = undefined;
       }
 
       const config: PluginConfig = {
@@ -389,7 +400,11 @@ export const SetupMode: React.FC<SetupModeProps> = ({ onRunAlgorithm }) => {
         gsAbbreviations,
         gsReplacements,
         useFuzzyMatching,
-        useWordWeighting
+        useWordWeighting,
+        // נשמרים רק בקטגוריית הלכה, כדי שסשן של ש"ס/תנ"ך לא יישא אפיון שאינו נוגע לו.
+        ...(category === 'halacha'
+          ? { halachaMultiLinePieces, halachaSeifKatan: halachaMultiLinePieces && halachaSeifKatan }
+          : {})
       };
 
       onRunAlgorithm(
@@ -505,7 +520,7 @@ export const SetupMode: React.FC<SetupModeProps> = ({ onRunAlgorithm }) => {
         </div>
       )}
       <div className="max-w-7xl mx-auto w-full h-full flex flex-col min-h-0">
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 flex-1 min-h-0 items-stretch">
+        <div className="grid grid-cols-1 lg:grid-cols-12 lg:grid-rows-[minmax(0,1fr)] gap-6 flex-1 min-h-0 items-stretch">
         
         {/* Right Pane: Book Browser (4 Cols) */}
         <div className="lg:col-span-4 bg-[var(--color-surface-container-high)] text-[var(--color-on-surface)] rounded-[var(--radius-md)] shadow-sm border border-[var(--color-outline-variant)] flex flex-col h-full overflow-hidden">
@@ -621,17 +636,17 @@ export const SetupMode: React.FC<SetupModeProps> = ({ onRunAlgorithm }) => {
         </div>
 
         {/* Middle & Left Area (8 Cols) */}
-        <div className="lg:col-span-8 grid grid-cols-1 lg:grid-cols-2 gap-6 h-full items-stretch">
+        <div className="lg:col-span-8 min-h-0 grid grid-cols-1 lg:grid-cols-2 lg:grid-rows-[minmax(0,1fr)] gap-6 h-full items-stretch">
           {/* Middle Pane: Configuration & Settings */}
-          <div className="flex flex-col gap-4 h-full">
-            <div className="bg-[var(--color-surface-container-high)] text-[var(--color-on-surface)] rounded-[var(--radius-md)] shadow-sm border border-[var(--color-outline-variant)] flex flex-col flex-1 overflow-y-auto">
+          <div className="flex flex-col gap-4 h-full min-h-0">
+            <div className="bg-[var(--color-surface-container-high)] text-[var(--color-on-surface)] rounded-[var(--radius-md)] shadow-sm border border-[var(--color-outline-variant)] flex flex-col flex-1 min-h-0 overflow-hidden">
               <div className="p-3.5 flex items-center gap-2 shrink-0">
                 <Settings2 className="w-5 h-5 text-[var(--color-primary)]" />
                 <h3 className="text-sm font-bold text-[var(--color-on-surface)]">
                   אפיון והגדרות מיפוי
                 </h3>
               </div>
-              <div className="p-5 flex-1 overflow-y-auto">
+              <div className="p-5 flex-1 min-h-0 overflow-y-auto">
                 <div className="bg-[var(--color-surface)] border border-[var(--color-outline-variant)] rounded-[var(--radius-md)] flex flex-col divide-y divide-[var(--color-outline-variant)] overflow-hidden shadow-xs">
                   {/* Box 1: Source Category & Target Book */}
                   <div className="p-4 flex flex-col gap-5">
@@ -665,6 +680,18 @@ export const SetupMode: React.FC<SetupModeProps> = ({ onRunAlgorithm }) => {
                           {category === 'shas' && <Check className="w-3.5 h-3.5" />}
                           ש"ס
                         </button>
+                        <button
+                          type="button"
+                          onClick={() => setCategory('halacha')}
+                          className={`flex-1 flex items-center justify-center gap-1.5 py-1.5 px-3 text-xs rounded-[var(--radius-sm)] transition-all ${
+                            category === 'halacha'
+                              ? 'bg-[var(--color-primary-subtle)] text-[var(--color-primary)] font-bold'
+                              : 'text-[var(--color-on-surface-variant)] hover:text-[var(--color-on-surface)] font-semibold bg-transparent'
+                          }`}
+                        >
+                          {category === 'halacha' && <Check className="w-3.5 h-3.5" />}
+                          הלכה
+                        </button>
                       </div>
                     </div>
                     {/* Target Book Dropdown */}
@@ -678,7 +705,7 @@ export const SetupMode: React.FC<SetupModeProps> = ({ onRunAlgorithm }) => {
                         onChange={e => setTargetBook(e.target.value)}
                         className="w-full p-2.5 text-sm bg-[var(--color-surface)] border border-[var(--color-outline)] rounded-[var(--radius-sm)] text-[var(--color-on-surface)] focus:outline-none focus:border-[var(--color-primary)]"
                       >
-                        {(category === 'tanakh' ? TANAKH_BOOKS : SHAS_TRACTATES).map(book => (
+                        {booksForCategory(category).map(book => (
                           <option key={book} value={book}>
                             {book}
                           </option>
@@ -703,6 +730,53 @@ export const SetupMode: React.FC<SetupModeProps> = ({ onRunAlgorithm }) => {
                         onChange={setIgnoreShamInShas}
                         ariaLabel="הפנה לדף הנוכחי"
                       />
+                    </div>
+                  )}
+
+                  {/* Box 2b: מבנה הקטעים בספר ההלכה — קובע מי נכנס לחיפוש ומי יורש הקשר */}
+                  {category === 'halacha' && (
+                    <div className="p-4 flex flex-col gap-4">
+                      <div className="flex items-center justify-between gap-3">
+                        <div className="space-y-0.5">
+                          <span className="block text-sm font-bold text-[var(--color-on-surface)]">
+                            קטע פירוש מתחלק לכמה שורות
+                          </span>
+                          <span className="block text-xs text-[var(--color-on-surface-variant)]">
+                            כבה אם כל קטע פירוש בספר הוא שורה אחת
+                          </span>
+                        </div>
+                        <ToggleSwitch
+                          checked={halachaMultiLinePieces}
+                          onChange={setHalachaMultiLinePieces}
+                          ariaLabel="קטע פירוש מתחלק לכמה שורות"
+                        />
+                      </div>
+
+                      {halachaMultiLinePieces && (
+                        <div className="flex items-center justify-between gap-3 pt-4 border-t border-[var(--color-outline-variant)]">
+                          <div className="space-y-0.5">
+                            <span className="block text-sm font-bold text-[var(--color-on-surface)]">
+                              הספר מחולק לסעיפים קטנים
+                            </span>
+                            <span className="block text-xs text-[var(--color-on-surface-variant)]">
+                              ס"ק מסומן במספור באותיות — (א), ב) — בראש הקטע או בשורה משלו
+                            </span>
+                          </div>
+                          <ToggleSwitch
+                            checked={halachaSeifKatan}
+                            onChange={setHalachaSeifKatan}
+                            ariaLabel="הספר מחולק לסעיפים קטנים"
+                          />
+                        </div>
+                      )}
+
+                      <p className="text-xs text-[var(--color-on-surface-variant)] bg-[var(--color-surface-container-high)] rounded-[var(--radius-sm)] p-2.5 leading-relaxed">
+                        {!halachaMultiLinePieces
+                          ? 'כל שורה היא קטע פירוש בפני עצמו: כל שורה נכנסת לחיפוש, ושורה שלא נמצא לה מקור נשארת בלי קישור. אין ס"ק ואין ירושת הקשר.'
+                          : !halachaSeifKatan
+                            ? 'כל שורה נכנסת לחיפוש, ושורה שלא נמצא לה מקור יורשת את ההקשר של השורה שמעליה.'
+                            : 'רק הקטע הראשון בכל ס"ק נכנס לחיפוש; שאר השורות יורשות את ההקשר שלו. כאשר המספור עומד בשורה משלו — כשורת כותרת או לבדו — החיפוש נעשה בשורה שאחריה.'}
+                      </p>
                     </div>
                   )}
 
@@ -733,15 +807,15 @@ export const SetupMode: React.FC<SetupModeProps> = ({ onRunAlgorithm }) => {
           </div>
 
           {/* Left Pane: Algorithm Settings */}
-          <div className="flex flex-col gap-4 h-full">
-            <div className="bg-[var(--color-surface-container-high)] text-[var(--color-on-surface)] rounded-[var(--radius-md)] shadow-sm border border-[var(--color-outline-variant)] flex flex-col flex-1 overflow-y-auto">
+          <div className="flex flex-col gap-4 h-full min-h-0">
+            <div className="bg-[var(--color-surface-container-high)] text-[var(--color-on-surface)] rounded-[var(--radius-md)] shadow-sm border border-[var(--color-outline-variant)] flex flex-col flex-1 min-h-0 overflow-hidden">
               <div className="p-3.5 flex items-center gap-2 shrink-0">
                 <Settings2 className="w-5 h-5 text-[var(--color-primary)]" />
                 <h3 className="text-sm font-bold text-[var(--color-on-surface)]">
                   הגדרות אלגוריתם
                 </h3>
               </div>
-              <div className="p-5 flex flex-col gap-5">
+              <div className="p-5 flex-1 min-h-0 overflow-y-auto flex flex-col gap-5">
                 <div className="bg-[var(--color-surface)] border border-[var(--color-outline-variant)] rounded-[var(--radius-md)] flex flex-col divide-y divide-[var(--color-outline-variant)] overflow-hidden">
                   {/* Rashei Teivot Abbreviation Expansion Settings */}
                   <div className="p-4 flex flex-col gap-3">

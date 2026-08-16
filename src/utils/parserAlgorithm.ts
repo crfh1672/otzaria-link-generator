@@ -1,4 +1,4 @@
-import { OtzariaLink, PluginConfig, DHHighlight } from '../types';
+import { OtzariaLink, PluginConfig, DHHighlight, SessionState } from '../types';
 import { expandAbbreviationsInText, DEFAULT_ABBREVIATIONS, NORMALIZED_ABBREVIATIONS_MAP, ABBR_MARK } from '../data/abbreviations';
 
 /**
@@ -10,6 +10,20 @@ import { expandAbbreviationsInText, DEFAULT_ABBREVIATIONS, NORMALIZED_ABBREVIATI
 const ABBR_DAMP = 0.6;
 import { getWordSimilarity, getNikudFingerprint, levenshteinDistance } from './fuzzyUtils';
 import { getCombinedWordWeight, calculateDocumentIdfWeights, HEBREW_STOP_WORDS } from './wordWeights';
+import {
+  SourceProfile,
+  DEFAULT_PROFILE,
+  PassSpec,
+  basePassSpec,
+  passSpecsFor,
+  profileForConfig,
+  hasHalachaNumbering,
+  stripHalachaNumbering,
+  stripHalachaLeadIn,
+  isNumberedContentHeader,
+  isSeifKatanMarkerLine,
+  findDhBoundary
+} from './halachaAlgorithm';
 
 /**
  * Anchor policy for the TARGET-document side of the matcher (see calcContiguousScore and
@@ -26,9 +40,9 @@ import { getCombinedWordWeight, calculateDocumentIdfWeights, HEBREW_STOP_WORDS }
  * Removing the cap outright would reopen exactly the false positive it was added for: a
  * single incidental word matching deep inside a long Gemara line. So the anchor is now
  * unrestricted in POSITION but qualified by EVIDENCE:
- *   • offset 0..SHALLOW_ANCHOR_LIMIT-1 — "shallow": accepted as before, any run length.
- *   • offset >= SHALLOW_ANCHOR_LIMIT   — "deep": accepted only when backed by a contiguous
- *     run of at least DEEP_ANCHOR_MIN_RUN words. A 10-word run at offset 3 is strong
+ *   • offset 0..shallowAnchorLimit-1 — "shallow": accepted as before, any run length.
+ *   • offset >= shallowAnchorLimit   — "deep": accepted only when backed by a contiguous
+ *     run of at least deepAnchorMinRun words. A 10-word run at offset 3 is strong
  *     evidence; a lone word at offset 40 is noise.
  *
  * Scope, deliberately narrow — this governs the SOURCE/target line only:
@@ -42,9 +56,13 @@ import { getCombinedWordWeight, calculateDocumentIdfWeights, HEBREW_STOP_WORDS }
  * or stay equal, so no line that previously matched can stop matching. What can change is
  * which line wins when a deep run on one line now outscores a shallow run on another —
  * which is the point.
+ *
+ * BOTH BOUNDS NOW COME FROM THE PASS SPEC (`PassSpec.shallowAnchorLimit` /
+ * `.deepAnchorMinRun`, halachaAlgorithm.ts). `basePassSpec` returns 3 and 3 — the values
+ * that were written here — so nothing about the policy above has changed. What changed is
+ * that a later pass over the same book can carry different ones, which is the only way a
+ * one- or two-word ד"ה sitting mid-line can ever be scored at all.
  */
-const SHALLOW_ANCHOR_LIMIT = 3;
-const DEEP_ANCHOR_MIN_RUN = 3;
 
 /**
  * ── Single-word Dibur Hamatchil: the first-word anchor ────────────────────────────────────
@@ -88,8 +106,11 @@ const DEEP_ANCHOR_MIN_RUN = 3;
  * that no configuration of the engine could previously produce, no line lost a link, and of the
  * cases an independent judge could rule on, it picked the same line every time. See
  * docs/SIMULATION_SINGLE_WORD_DH.md and qa/variant/ for the simulation this was derived from.
+ *
+ * The ratio itself now comes from the source profile (SourceProfile.swdhMaxOpeningRatio):
+ * 0.008 for ש"ס/תנ"ך, exactly as measured above, and 0.02 for ספרי הלכה — there only a
+ * numbered line ever reaches this stage, so the gate is already narrow by construction.
  */
-const SWDH_MAX_OPENING_RATIO = 0.008;
 /** Anchor must have at least this many letters — a 1–2 letter token carries no evidence. */
 const SWDH_MIN_LETTERS = 3;
 
@@ -127,7 +148,9 @@ function computeDynamicMinThreshold(
   expectedWeight: number,
   wordCount: number,
   isExplicit: boolean,
-  multiplier: number
+  multiplier: number,
+  minAccept?: number,
+  scoreCap: number = 1.5
 ): number {
   let fraction: number;
   let floor: number;
@@ -148,7 +171,19 @@ function computeDynamicMinThreshold(
   // multiplier scales the tiered fraction proportionally (0.65 is the normal baseline).
   const scaledFraction = fraction * (multiplier / 0.65);
 
-  return Math.min(1.5, Math.max(floor, expectedWeight * scaledFraction));
+  // scoreCap comes from PassSpec.scoreCap; basePassSpec returns 1.5 — the constant that was
+  // written here — so the bar is unchanged for the single pass that runs today.
+  const dynamic = Math.min(scoreCap, Math.max(floor, expectedWeight * scaledFraction));
+
+  /**
+   * `minAccept` (SourceProfile.minAcceptScore) is a FLOOR under the dynamic bar, not a
+   * replacement for it. In ספרי הלכה the ד"ה now carries an explicit punctuation boundary,
+   * so `expectedWeight` is measured over the two-word quote instead of the whole paragraph
+   * — which drops this bar from a flat 1.5 to roughly 0.5. That is a real relaxation, and
+   * it is only safe inside a narrowed search window; until the window exists the floor pins
+   * the bar where it effectively sits today. See docs/HALACHA_MULTIPASS_PLAN.md §3.
+   */
+  return minAccept === undefined ? dynamic : Math.max(dynamic, minAccept);
 }
 
 /**
@@ -305,6 +340,12 @@ const CONF = {
   INHERIT_RETENTION: 0.80,
   /** Confidence assumed for an inherited link whose parent's confidence is unknown. */
   INHERIT_FALLBACK: 70,
+  /** קנס בלוג-אודס לכל שלב במורד סולם המעברים — ראו passLadderPenalty. */
+  PASS_PENALTY_PER_STEP: 0.18,
+  /** הזיכוי המרבי על חלון שהוכרע לחלוטין (שורה אחת אפשרית). */
+  WINDOW_CREDIT_MAX: 0.9,
+  /** מעל כמה שורות בחלון הזיכוי מתאפס. */
+  WINDOW_CREDIT_SPAN: 8,
   MIN: 5,
   MAX: 99
 } as const;
@@ -324,6 +365,41 @@ export interface ConfidenceInputs {
   /** Which flexibility-ladder rung produced the match, if any. */
   retryRung?: RetryRung | null;
   evidence?: MatchEvidence | null;
+  /**
+   * כמה שלבים במורד סולם המעברים ירד המעבר שייצר את ההתאמה (0 = המעבר הראשון), וכמה שורות
+   * מקור היו אפשריות בזמן ההכרעה. ראו `passLadderPenalty`.
+   *
+   * שני אלה **אינם נשמרים על הקישור ואינם מוצגים** — הם נצרכים כאן ונזרקים. מה שהמשתמש רואה
+   * הוא אחוז אחד, וזה כל מה שהוא צריך כדי לדעת במה לפתוח את הבדיקה.
+   */
+  passIndex?: number;
+  searchRangeWidth?: number;
+}
+
+/**
+ * הקנס בלוג-אודס על מעבר שירד בסולם, בניכוי הזיכוי על חלון צר.
+ *
+ * שני הגדלים מושכים לכיוונים מנוגדים, וזו הנקודה:
+ *
+ * • **עומק בסולם מחליש.** מעבר מאוחר הרפה יותר — רף נמוך יותר, רצף קצר יותר, התאמה מטושטשת —
+ *   ולכן אותה התאמה עצמה נשענת על פחות.
+ * • **חלון צר מחזק.** קישור שהוכרע כשנשארו שתי שורות אפשריות ודאי הרבה יותר מאותה התאמה
+ *   בדיוק שהוכרעה על פני סימן בן עשרים סעיפים. זו בדיוק העסקה שהתוכנית עושה — החלון משלם על
+ *   ההרפיה — ואם הוודאות לא תשקף אותה, סדר הבדיקה יטעה את הבודק.
+ *
+ * הזיכוי חסום כך שלא יהפוך לבונוס: הוא מקזז קנס ולעולם אינו מוסיף מעבר לאפס.
+ *
+ * בש"ס רץ מעבר אחד ואין חלונות, ולכן שני הגדלים אפס והפונקציה מחזירה 0.
+ */
+function passLadderPenalty(passIndex?: number, searchRangeWidth?: number): number {
+  const depth = passIndex ?? 0;
+  if (depth <= 0) return 0;
+  const penalty = CONF.PASS_PENALTY_PER_STEP * depth;
+  const width = searchRangeWidth;
+  const credit = width === undefined
+    ? 0
+    : CONF.WINDOW_CREDIT_MAX * (1 - clamp01((width - 1) / CONF.WINDOW_CREDIT_SPAN));
+  return Math.max(0, penalty - credit);
 }
 
 /**
@@ -351,7 +427,11 @@ export function calculateLinkConfidence(inp: ConfidenceInputs): number {
   if (!ev || ev.runWords <= 0 || ev.windowWeight <= 0) {
     // No usable evidence was recorded — report the model's neutral point rather than
     // inventing a number the signals cannot support.
-    return toPercent(CONF.B0 - (inp.retryRung ? CONF.RUNG_PENALTY[inp.retryRung] : 0));
+    return toPercent(
+      CONF.B0
+      - (inp.retryRung ? CONF.RUNG_PENALTY[inp.retryRung] : 0)
+      - passLadderPenalty(inp.passIndex, inp.searchRangeWidth)
+    );
   }
 
   const coverage = clamp01(ev.matchedWeight / ev.windowWeight);
@@ -372,6 +452,7 @@ export function calculateLinkConfidence(inp: ConfidenceInputs): number {
   if (ev.exactPhrase) z += CONF.W_EXACT;
   if (inp.isExplicit) z += CONF.W_EXPLICIT;
   if (inp.retryRung) z -= CONF.RUNG_PENALTY[inp.retryRung];
+  z -= passLadderPenalty(inp.passIndex, inp.searchRangeWidth);
 
   return toPercent(z);
 }
@@ -382,6 +463,52 @@ export function calculateLinkConfidence(inp: ConfidenceInputs): number {
  */
 export function stripHtmlTags(text: string): string {
   return text.replace(/<[^>]*>/g, ' ');
+}
+
+/**
+ * A line that carries a heading tag. Deliberately profile-INDEPENDENT, unlike `isHeaderLine`:
+ * the halacha profile demotes a numbered `<h2>` to a content line, but the stored text must not
+ * depend on which profile happened to parse it — `isHeaderLine` is called elsewhere (export,
+ * inheritance chains) with no profile at all, and a line whose `<h2>` had been stripped under
+ * one profile would stop reading as a header under the other.
+ */
+const HEADER_TAG_RE = /<h[1-6][^>]*>[\s\S]*<\/h[1-6]>/i;
+
+/**
+ * Removes markup from a CONTENT line, tag and everything inside its angle brackets.
+ *
+ * The Otzaria corpora — the שולחן ערוך above all, the ש"ס after it — interleave the text with
+ * markup that is not text: empty footnote anchors (`<i data-commentator="Mishnah Berurah"
+ * data-label="א"></i>`, ~44k of them in או"ח alone), `<small>` around the Rema, `<strong>`/`<big>`
+ * around the משנה. None of it is anything the user asked to read or to search, and it leaks into
+ * BOTH: the row renderers print raw lines as literal text, and the per-token normalisation in
+ * `findSourceMatchRange` splits a tag on its spaces, so `data-label="א"` survives as a bare Hebrew
+ * word the Dibur Hamatchil can match against.
+ *
+ * Stripped ONCE at ingestion (see `parseDocumentSegments`) rather than at each display site, so
+ * the word indices in `dhHighlights` — which count tokens of the stored line — are computed over
+ * the same words that end up on screen.
+ *
+ * Deliberately NOT `stripHtmlTags`, which substitutes a space. Every tag these corpora use
+ * inside a content line is an INLINE element — `<i> <b> <small> <big> <strong> <img>`, and
+ * nothing else — so removing it outright is what a browser renders and what the typesetter
+ * meant. A space instead invents word boundaries that are not in the text: `<b>ש</b>שים` is
+ * the acrostic markup of בן יהוידע and reads ששים, not "ש שים", and the tag closing before
+ * the comma of `הַשַּׁבָּת</strong></big>,` would leave that comma standing as a word of its own.
+ * `<br>` is the one exception, being the only break among them.
+ *
+ * The words in these corpora are separated by real whitespace, never by markup alone, so
+ * nothing glues together — and the leading space that `stripHtmlTags` used to leave on a
+ * line opening with a tag is gone with it, which is what silently no-opped every `^`-anchored
+ * strip in `stripSecondaryPrefix` (BUG-03).
+ */
+const MARKUP_RUN_RE = /(?:<[^>]*>)+/g;
+const LINE_BREAK_TAG_RE = /<\s*br\b[^>]*>/i;
+
+export function stripContentMarkup(line: string): string {
+  if (!line || !line.includes('<')) return line;
+  const stripped = line.replace(MARKUP_RUN_RE, run => (LINE_BREAK_TAG_RE.test(run) ? ' ' : ''));
+  return stripped.replace(/[^\S\n]{2,}/g, ' ').trim();
 }
 
 /**
@@ -465,18 +592,27 @@ export function normalizeText(text: string, keepColonsAndDots: boolean = false):
 /**
  * Extracts header titles from text line if line is a header tag (e.g. <h1>...</h1>, # ...)
  */
-export function isHeaderLine(line: string): boolean {
+export function isHeaderLine(line: string, profile?: SourceProfile): boolean {
   const trimmed = line.trim();
-  return /<h[1-6][^>]*>.*<\/h[1-6]>/i.test(trimmed) || /^#{1,6}\s+/.test(trimmed);
+  const looksLikeHeader = /<h[1-6][^>]*>.*<\/h[1-6]>/i.test(trimmed) || /^#{1,6}\s+/.test(trimmed);
+  if (!looksLikeHeader) return false;
+  // בפרופיל הלכה כותרת ממוספרת שאינה כותרת "סימן" היא שורת תוכן, לא גבול-סגמנט —
+  // ראו isNumberedContentHeader. בכל פרופיל אחר `profile` אינו מועבר וההתנהגות זהה לקודמת.
+  if (profile?.numberedHeadersAreContent && isNumberedContentHeader(line)) return false;
+  return true;
 }
 
 export function extractHeaderTitle(line: string): string {
   const trimmed = line.trim();
+  // The heading tag itself is kept on the stored line (it is the segment boundary), so the
+  // title extracted from it is the one place a header's own markup can still reach the screen —
+  // both the inner markup of a `<h2>ברכות <i …></i>ב א</h2>` and the whole of a bare `# ` line.
+  // Comparison is unaffected: normalizeHeaderForComparison strips tags anyway.
   const htmlMatch = trimmed.match(/<h[1-6][^>]*>(.*?)<\/h[1-6]>/i);
-  if (htmlMatch) return htmlMatch[1];
+  if (htmlMatch) return stripContentMarkup(htmlMatch[1]);
   const mdMatch = trimmed.match(/^#{1,6}\s+(.*)/);
-  if (mdMatch) return mdMatch[1];
-  return trimmed;
+  if (mdMatch) return stripContentMarkup(mdMatch[1]);
+  return stripContentMarkup(trimmed);
 }
 
 export function normalizeHeaderForComparison(header: string): string {
@@ -493,14 +629,36 @@ export function normalizeHeaderForComparison(header: string): string {
 }
 
 /**
+ * האם `haystack` מכיל את `needle` **כרצף מילים שלמות** — לא כרצף תווים.
+ *
+ * ריפוד ברווחים משני הצדדים הופך את מבחן ההכלה לכזה שקצותיו חייבים ליפול על גבול מילה, ולכן
+ * "סימן י" אינו מוכל ב"סימן יא" (אחרי `י` בא `א` ולא רווח) בעוד "ברכות" מוכל ב"פני יהושע על
+ * ברכות". `normalizeText` כבר איחד רווחים, כך שדי בהשוואה אחת.
+ */
+function containsWholeWords(haystack: string, needle: string): boolean {
+  return ` ${haystack} `.includes(` ${needle} `);
+}
+
+/**
  * Compares two header strings according to SRS rule:
  * Ignore header level, normalize daf/chapter variations, match normalized text.
+ *
+ * ההתאמה היא זהות, או **הכלה של מילים שלמות** — וההבחנה הזאת היא כל העניין. הכלה ברמת התו
+ * שברה את ספרי ההלכה: המספר בכותרת שלהם יושב בסוף המחרוזת ואין אחריו דבר ("סימן יא"), ולכן
+ * מספר קצר הוא תחילית מושלמת של הארוך ממנו. "סימן י" תפס את "סימן יא", "סימן יב"…, והבחירה —
+ * ההתאמה הראשונה בסדר המסמך — שלחה כל סימן שאחרי מספר עגול להיסרק בתוך העגול שקדם לו. בש"ס
+ * הבאג לא צף מפני שהמספר יושב באמצע ואחריו סיומת קבועה (`דף י עמוד א` מול `דף יא עמוד א`).
+ *
+ * ההכלה עצמה נחוצה ואינה מוותרת עליה: היא מה שמחבר כותרת שנכתבה במלואה לכותרת חשופה — שם הספר
+ * ("פני יהושע על ברכות" מול "ברכות"), או כותרת דף שצד אחד מקדים לה את שם המסכת ("ברכות דף ב
+ * עמוד א" מול "דף ב עמוד א"). בכל אלה ההשמטה היא של **מילים שלמות**, ולכן גבול המילה מפריד
+ * בדיוק בין ההכלה הנחוצה לבין ההתנגשות המקרית.
  */
 export function areHeadersMatching(h1: string, h2: string): boolean {
   const norm1 = normalizeHeaderForComparison(h1);
   const norm2 = normalizeHeaderForComparison(h2);
   if (!norm1 || !norm2) return false;
-  return norm1 === norm2 || norm1.includes(norm2) || norm2.includes(norm1);
+  return norm1 === norm2 || containsWholeWords(norm1, norm2) || containsWholeWords(norm2, norm1);
 }
 
 /**
@@ -817,11 +975,28 @@ export function isBaadContinuationLine(line: string): boolean {
  * what it continues. Headers are skipped in the scan so an empty segment (header immediately
  * followed by another header) does not hide the בא"ד line behind it.
  */
-export function firstContentLineIsBaad(lines: string[], fromLineIdx1: number): boolean {
+export function firstContentLineIsBaad(lines: string[], fromLineIdx1: number, profile?: SourceProfile): boolean {
   for (let i = Math.max(1, fromLineIdx1); i <= lines.length; i++) {
     const raw = lines[i - 1] ?? '';
-    if (!raw.trim() || isHeaderLine(raw)) continue;
+    if (!raw.trim() || isHeaderLine(raw, profile)) continue;
     return isBaadContinuationLine(raw);
+  }
+  return false;
+}
+
+/**
+ * המקבילה ההלכתית ל-firstContentLineIsBaad: האם שורת התוכן הראשונה מ-fromLineIdx1 ואילך היא
+ * שורה בלי מספור, כלומר המשך של הקטע שמעל הכותרת ולא פתיחה של קטע חדש.
+ */
+export function firstContentLineIsUnnumbered(
+  lines: string[],
+  fromLineIdx1: number,
+  profile?: SourceProfile
+): boolean {
+  for (let i = Math.max(1, fromLineIdx1); i <= lines.length; i++) {
+    const raw = lines[i - 1] ?? '';
+    if (!raw.trim() || isHeaderLine(raw, profile)) continue;
+    return !hasHalachaNumbering(raw);
   }
   return false;
 }
@@ -837,15 +1012,20 @@ export interface HeaderSegment {
  * Breaks a full document string into physical lines and header segments.
  * Strictly preserves physical line breaks (\n / \r\n).
  */
-export function parseDocumentSegments(rawText: string): { lines: string[]; segments: HeaderSegment[] } {
-  const lines = rawText.split(/\r?\n/);
+export function parseDocumentSegments(rawText: string, profile?: SourceProfile): { lines: string[]; segments: HeaderSegment[] } {
+  // Markup is dropped here, at the single point every document passes through, so the stored
+  // lines are the ones searched, indexed and displayed alike. Heading tags stay: they are what
+  // marks a segment boundary. Idempotent, which is what lets the callers that re-parse an
+  // already-parsed session (export, the editor's segment list) hand their lines straight back.
+  const lines = rawText.split(/\r?\n/)
+    .map(line => (HEADER_TAG_RE.test(line) ? line : stripContentMarkup(line)));
   const segments: HeaderSegment[] = [];
-  
+
   let currentHeader: HeaderSegment | null = null;
 
   for (let i = 0; i < lines.length; i++) {
     const lineNum = i + 1; // 1-based
-    if (isHeaderLine(lines[i])) {
+    if (isHeaderLine(lines[i], profile)) {
       if (currentHeader) {
         currentHeader.endLine = i; // Line before current header
         segments.push(currentHeader);
@@ -876,6 +1056,28 @@ export function parseDocumentSegments(rawText: string): { lines: string[]; segme
 }
 
 /**
+ * הסגמנט בספר היעד שסגמנט הפירוש מיושר אליו, או `undefined` כשאין כזה.
+ *
+ * **נקודת הכניסה היחידה ליישור סגמנטים** — המנוע, העורך והייצוא קוראים לה כולם, כדי ששלושתם
+ * יראו את אותה חלוקה.
+ *
+ * זהות קודמת להכלה, ולא ההתאמה הראשונה בסדר המסמך. `areHeadersMatching` כבר מונע את ההתנגשות
+ * שהייתה כאן (ראו שם), אך שתי הדרכים אינן שוות ערך: כותרת מוכלת היא ראיה חלשה מזהות, ואם שתיהן
+ * קיימות במסמך אין סיבה להכריע לפי מי מהן נכתבה קודם.
+ */
+export function findMatchingSegment(
+  segments: HeaderSegment[] | null | undefined,
+  commHeaderTitle: string
+): HeaderSegment | undefined {
+  if (!segments || segments.length === 0) return undefined;
+  const norm = normalizeHeaderForComparison(commHeaderTitle);
+  return (
+    segments.find(s => normalizeHeaderForComparison(s.headerTitle) === norm) ??
+    segments.find(s => areHeadersMatching(commHeaderTitle, s.headerTitle))
+  );
+}
+
+/**
  * Index of the first commentary segment whose header has a counterpart ("כותרת מקבילה") in any
  * of the target documents, or -1 when no commentary header matches anything.
  *
@@ -895,9 +1097,7 @@ export function findFirstAlignedSegmentIndex(
   targetSegmentLists: (HeaderSegment[] | null | undefined)[]
 ): number {
   return commSegments.findIndex(commSeg =>
-    targetSegmentLists.some(list =>
-      !!list && list.some(s => areHeadersMatching(commSeg.headerTitle, s.headerTitle))
-    )
+    targetSegmentLists.some(list => !!findMatchingSegment(list, commSeg.headerTitle))
   );
 }
 
@@ -912,13 +1112,14 @@ export function findLinkingStartLine(
   commentaryLines: string[],
   sourceLines: string[],
   rashiLines?: string[],
-  tosafotLines?: string[]
+  tosafotLines?: string[],
+  profile?: SourceProfile
 ): number {
   if (!commentaryLines || commentaryLines.length === 0) return 1;
 
-  const commSegments = parseDocumentSegments(commentaryLines.join('\n')).segments;
+  const commSegments = parseDocumentSegments(commentaryLines.join('\n'), profile).segments;
   const segmentsOf = (lines?: string[]) =>
-    lines && lines.length > 0 ? parseDocumentSegments(lines.join('\n')).segments : null;
+    lines && lines.length > 0 ? parseDocumentSegments(lines.join('\n'), profile).segments : null;
 
   const firstAligned = findFirstAlignedSegmentIndex(commSegments, [
     segmentsOf(sourceLines),
@@ -933,11 +1134,15 @@ export function findLinkingStartLine(
 
 /**
  * Extracts potential Dibur Hamatchil search phrase from commentary line.
+ *
+ * `profile` selects the boundary policy. It is optional, and its absence means
+ * `DEFAULT_PROFILE` — so every existing caller keeps the ש"ס behaviour untouched.
  */
 export function extractDiburHamatchil(
   line: string,
   delimiter?: string,
-  maxWords: number = 12
+  maxWords: number = 12,
+  profile: SourceProfile = DEFAULT_PROFILE
 ): { dhText: string; cleanDh: string; isExplicitDelimiter: boolean } {
   const cleanLine = stripHtmlTags(line);
   const normLine = normalizeText(cleanLine, true);
@@ -945,6 +1150,8 @@ export function extractDiburHamatchil(
 
   let dhPart = '';
   let explicit = false;
+  // ספרי הלכה בלבד: מקף / נקודה / נקודתיים / "כו'" — ראו findDhBoundary והערת "גבול הד"ה".
+  const punctBoundary = profile.dhTerminatesAtPunctuation ? findDhBoundary(cleanLine) : null;
 
   // 1. If custom delimiter defined, non-empty, and present in line
   if (delimiter && delimiter.trim() && cleanLine.includes(delimiter.trim())) {
@@ -953,12 +1160,21 @@ export function extractDiburHamatchil(
     dhPart = cleanLine.substring(0, idx);
     explicit = true;
   }
-  // 2. Check for כו' / וכו' / וגו' / וגומר / וכולי
-  else if (/(?:^|\s)(?:ו?כו'|וגו'|וגומר|וכולי)(?:\s|$|[.,:;])/i.test(cleanLine)) {
+  // 2. ספרי הלכה: אסימון הפיסוק סוגר את הד"ה, בלי תלות בהגדרות המשתמש.
+  else if (punctBoundary !== null) {
+    dhPart = cleanLine.substring(0, punctBoundary);
+    explicit = true;
+  }
+  // 3. Check for כו' / וכו' / וגו' / וגומר / וכולי — the ש"ס continuation-segment path.
+  //    Off in ספרי הלכה, where branch 2 already cut the ד"ה at the כו' itself.
+  else if (
+    profile.usesContinuationSegments &&
+    /(?:^|\s)(?:ו?כו'|וגו'|וגומר|וכולי)(?:\s|$|[.,:;])/i.test(cleanLine)
+  ) {
     dhPart = cleanLine;
     explicit = true;
   }
-  // 3. Fallback when no delimiter configured: do NOT truncate automatically on '.' or ':'
+  // 4. Fallback when no delimiter configured: do NOT truncate automatically on '.' or ':'
   else {
     dhPart = cleanLine;
     explicit = false;
@@ -1076,10 +1292,31 @@ export function runLinkingParser(
   // Off by default -> identical return value, just without console I/O overhead.
   const DEBUG = (config as any).debug === true;
   if (DEBUG) console.log(`\n🚀 runLinkingParser START: config.targetBookName='${config.targetBookName}', rashiRaw=${!!rashiRaw}, tosafotRaw=${!!tosafotRaw}`);
-  const commDoc = parseDocumentSegments(commentaryRaw);
-  const srcDoc = parseDocumentSegments(sourceRaw);
-  const rashiDoc = rashiRaw ? parseDocumentSegments(rashiRaw) : null;
-  const tosafotDoc = tosafotRaw ? parseDocumentSegments(tosafotRaw) : null;
+  /**
+   * מדיניות השורות של קטגוריית המקור ושל מבנה הקטעים שנבחר באפיון — נבחרת פעם אחת ומחליפה
+   * קומץ קבועים שהיו קשיחים בקוד. עבור 'shas' ו-'tanakh' הפרופיל הוא DEFAULT_PROFILE, שכל
+   * ערכיו זהים לקבועים הקודמים, ולכן הפלט לקטגוריות האלה אינו משתנה.
+   * ראו src/utils/halachaAlgorithm.ts.
+   */
+  const profile = profileForConfig(config);
+  /**
+   * כוונוני המעבר הנוכחי. היום רץ מעבר אחד בלבד, ו-`basePassSpec` מחזיר בדיוק את הקבועים
+   * שהיו כתובים קשיח במנוע — ולכן הפלט אינו משתנה כהוא זה.
+   *
+   * `let` ולא `const`, ולא פרמטר: פונקציות החיפוש (`searchLineInDoc`,
+   * `searchPrimaryWithFirstAnchor`, `attemptFlexibleRetry`) הן סגירות שמוגדרות פעם אחת לפני
+   * לולאת השורות, וכולן קוראות מכאן. כשמנוע המעברים ייכנס (שלב 4 בתוכנית) הוא יציב כאן את
+   * הרשומה של כל מעבר לפני שהוא מריץ אותו — הרצה סדרתית וסינכרונית, בלי מקביליות. החלופה,
+   * להשחיל פרמטר רביעה-עשר דרך שש נקודות קריאה שכבר נושאות שלוש-עשרה, הייתה מסתירה את
+   * השינוי בלי לקנות דבר כל עוד יש מעבר אחד.
+   */
+  let activePass: PassSpec = basePassSpec(profile, config.useFuzzyMatching !== false);
+  /** מיקום המעבר הפעיל בסולם — 0 לש"ס, שבו יש מעבר אחד. מזין את הוודאות בלבד. */
+  let activePassIndex = 0;
+  const commDoc = parseDocumentSegments(commentaryRaw, profile);
+  const srcDoc = parseDocumentSegments(sourceRaw, profile);
+  const rashiDoc = rashiRaw ? parseDocumentSegments(rashiRaw, profile) : null;
+  const tosafotDoc = tosafotRaw ? parseDocumentSegments(tosafotRaw, profile) : null;
 
   const enableWordWeighting = config.useWordWeighting !== false;
   const srcIdfMap = enableWordWeighting ? calculateDocumentIdfWeights(srcDoc.lines, commDoc.lines) : undefined;
@@ -1165,7 +1402,10 @@ export function runLinkingParser(
     const seg3Words = contWords(seg3);
 
     const abbrDict = config.customAbbreviations || config.gsAbbreviations || DEFAULT_ABBREVIATIONS;
-    const enableFuzzy = config.useFuzzyMatching !== false;
+    // From the pass spec, like the copy in searchLineInDoc — otherwise a pass that turns
+    // fuzzy matching off would leave this path fuzzy. Identical value for the single pass
+    // that runs today (basePassSpec seeds it from the same config flag).
+    const enableFuzzy = activePass.fuzzy;
 
     // Perf: seg1/seg2/seg3 are fixed for this call while the context line varies, and the
     // seg2/seg3 look-ahead windows re-scan the same lines for every consecutive anchor —
@@ -1502,12 +1742,12 @@ export function runLinkingParser(
     // whole searchLineInDoc call. Recreating a function closure on every single scanned line
     // (potentially thousands of times per call, across up to two phases) does no useful work;
     // hoisting them here computes/creates them once instead, with identical results.
-    const enableFuzzy = config.useFuzzyMatching !== false;
+    const enableFuzzy = activePass.fuzzy;
 
     // Exact-substring match for the isExplicit path, under the same target-side anchor policy
-    // as calcContiguousScore below (SHALLOW_ANCHOR_LIMIT / DEEP_ANCHOR_MIN_RUN, see the note
+    // as calcContiguousScore below (shallowAnchorLimit / deepAnchorMinRun, see the note
     // at the top of this file): a shallow occurrence counts on its own, a deeper one counts
-    // when the phrase is at least DEEP_ANCHOR_MIN_RUN words — a multi-word verbatim quote is
+    // when the phrase is at least deepAnchorMinRun words — a multi-word verbatim quote is
     // strong evidence wherever it sits in the line, a one-word one deep inside it is not.
     //
     // Two deliberate details:
@@ -1523,16 +1763,19 @@ export function runLinkingParser(
       for (let idx = haystack.indexOf(needle); idx !== -1; idx = haystack.indexOf(needle, idx + 1)) {
         const wordsBefore = haystack.slice(0, idx).trim();
         const offsetWords = wordsBefore ? wordsBefore.split(/\s+/).filter(Boolean).length : 0;
-        if (offsetWords <= SHALLOW_ANCHOR_LIMIT) return true;
-        if (needleWordCount >= DEEP_ANCHOR_MIN_RUN) return true;
+        if (offsetWords <= activePass.shallowAnchorLimit) return true;
+        if (needleWordCount >= activePass.deepAnchorMinRun) return true;
       }
       return false;
     };
 
     const calcContiguousScore = (sourceWords: string[], targetWords: string[]): { score: number; wordCount: number; simSum: number } => {
-      // COMMENTARY SIDE — unchanged. A match must still begin within the first 3 words of
-      // the commentary line; nothing in the BUG-02 anchor fix touches this.
-      const maxStartIdx = Math.min(3, sourceWords.length);
+      // COMMENTARY SIDE — a match must still begin within the first few words of the commentary
+      // line; nothing in the BUG-02 anchor fix touches this. The bound is 3 for ש"ס/תנ"ך exactly
+      // as before, and 2 in ספרי הלכה — there the מספור already marks where the למה starts, so
+      // anything more than one word past it is the מחבר's own prose. It reaches here through
+      // PassSpec.maxStartIdx, which basePassSpec seeds from profile.maxDhStartIdx.
+      const maxStartIdx = Math.min(activePass.maxStartIdx, sourceWords.length);
       // Cap source to maxDhWords (7 for Tosafot, 12 for other sources by default)
       const cappedSource = sourceWords.slice(0, maxDhWords);
 
@@ -1543,7 +1786,7 @@ export function runLinkingParser(
       // the identical arithmetic with the redundancy removed.
       const sourceWeights = cappedSource.map(w => getCombinedWordWeight(w, enableWordWeighting, idfMap));
 
-      // TARGET SIDE — see the SHALLOW_ANCHOR_LIMIT / DEEP_ANCHOR_MIN_RUN policy note at the
+      // TARGET SIDE — see the shallowAnchorLimit / deepAnchorMinRun policy note at the
       // top of this file. requireStartAtFirstWord (secondary sources) still pins the anchor
       // to target word 0 exactly; otherwise every position is reachable, with deep ones
       // gated on run length below. Loop-invariant, so hoisted out of the startWIdx loop.
@@ -1599,7 +1842,7 @@ export function runLinkingParser(
           // FIX ח׳: this guard was written to count WORDS of the target. Once an abbreviation
           // collapses into one source item the two stopped being the same number, so count the
           // target words actually consumed.
-          if (docWIdx >= SHALLOW_ANCHOR_LIMIT && kt < DEEP_ANCHOR_MIN_RUN) continue;
+          if (docWIdx >= activePass.shallowAnchorLimit && kt < activePass.deepAnchorMinRun) continue;
           if (seqScore > maxSeqScore) {
             maxSeqScore = seqScore;
             bestWordCount = kt;
@@ -1819,9 +2062,31 @@ export function runLinkingParser(
       // see computeDynamicMinThreshold (BUG-01 fix). thresholdMultiplier (default 0.65) is
       // still threaded through so callers — specifically the explicit-reference flexibility
       // ladder's last rung — can further lower the acceptance bar.
-      const minThreshold = computeDynamicMinThreshold(expectedWeight, wordsForWeight.length, isExplicit, thresholdMultiplier);
+      const minThreshold = computeDynamicMinThreshold(
+        expectedWeight, wordsForWeight.length, isExplicit, thresholdMultiplier,
+        activePass.minScore, activePass.scoreCap
+      );
 
-        if (currentMatchCount >= minThreshold) {
+      /**
+       * The acceptance floor has to bite on BOTH scoring routes.
+       *
+       * An exact-substring hit sets `currentMatchCount` to `expectedWeight + 10` — a RANKING
+       * device, so that a verbatim occurrence outranks any fuzzy run no matter how the
+       * weights fall. That constant also clears every threshold by construction, which turns
+       * the explicit-delimiter route into a way around the floor. For a one-word ד"ה
+       * "occurs verbatim within the first words of the line" is not evidence; the same word
+       * opens many lines of a סימן, and the winner is then settled by the distance
+       * tie-breaker below — a coin flip wearing a match's clothes.
+       *
+       * So when a profile sets a floor, what must clear it is the match's REAL weight, not
+       * the inflated ranking score. On the fuzzy route this is implied by the check below
+       * (`currentMatchCount` there is `currentMatchedWeight` times a ≤1 distance penalty),
+       * so the guard changes nothing there and constrains only the exact-substring route.
+       */
+      const clearsFloor =
+        activePass.minScore === undefined || currentMatchedWeight >= activePass.minScore;
+
+        if (clearsFloor && currentMatchCount >= minThreshold) {
           const dist = Math.abs(lNum - range.s);
 
           // Nikud fingerprint tie-breaker:
@@ -1985,9 +2250,11 @@ export function runLinkingParser(
   const swdhOpeningCount = new Map<string, number>();
   let swdhContentLines = 0;
   for (const raw of commDoc.lines) {
-    if (!raw || !raw.trim() || isHeaderLine(raw)) continue;
+    if (!raw || !raw.trim() || isHeaderLine(raw, profile)) continue;
     swdhContentLines++;
-    const t = raw.trim();
+    // המספור נחתך לפני הספירה בדיוק כפי שהוא נחתך לפני חילוץ הד"ה, אחרת "פותח את השורה"
+    // היה נמדד על אסימון המספור עצמו במקום על המילה הראשונה של הציטוט.
+    const t = stripHalachaLeadIn(raw, profile).trim();
     const stripped = stripSecondaryPrefix(t);
     const first = normalizeText(stripped.trim() ? stripped : t).split(/\s+/).filter(Boolean)[0];
     if (first) swdhOpeningCount.set(first, (swdhOpeningCount.get(first) || 0) + 1);
@@ -2019,10 +2286,75 @@ export function runLinkingParser(
     console.log(`  ⏭️  Skipping ${firstAlignedSegIdx} front-matter segment(s) before the first matching header '${commDoc.segments[firstAlignedSegIdx].headerTitle}'`);
   }
 
+  /**
+   * ── מנוע המעברים ─────────────────────────────────────────────────────────────────────────
+   *
+   * הספר נסרק כמה פעמים, מן הראיה החזקה אל החלשה (`passSpecsFor`). כל מעבר מטפל **רק ביחידות
+   * שטרם קושרו בזכות עצמן**, ולכן הוא יכול להוסיף קישורים אך לא לשנות קישור של מעבר שקדם לו —
+   * וההרפיה ההדרגתית בטוחה מעצם המבנה.
+   *
+   * **ירושה מחושבת מחדש בכל מעבר.** קישור מורש אינו ראיה עצמאית אלא נגזרת של העוגנים שסביבו,
+   * ומעבר שהוסיף עוגן משנה את ההקשר שכל השורות שאחריו יורשות. לכן הקישורים המורשים נמחקים
+   * בפתח כל מעבר ונבנים מחדש מאוסף העוגנים העדכני. בלי זה, שורה שירשה במעבר הראשון הייתה
+   * ננעלת על הקשר מיושן ולא הייתה נחפשת שוב.
+   *
+   * ש"ס ותנ"ך מקבלים מעבר אחד, ולכן `passIdx > 0` לעולם אינו מתקיים אצלם והזרימה זהה לחלוטין
+   * למה שהייתה לפני שהלולאה נוספה.
+   */
+  const passes = passSpecsFor(profile, config.useFuzzyMatching !== false);
+  /** העוגנים שנמצאו עד כה, לפי שורת הפירוש. מפתח לקיצור הדרך של המעבר הבא. */
+  let anchorByLine = new Map<number, OtzariaLink>();
+
+  /**
+   * החלון של כל יחידה, כפי שהעוגנים הקיימים בפתח המעבר כולאים אותה. מחושב פעם אחת למעבר —
+   * הוא נגזר מאוסף העוגנים, שאינו משתנה בתוך מעבר (מעבר רק מוסיף, ומה שהוא מוסיף אינו משנה
+   * חלון של יחידה שכבר נסרקה). `null` = בלי אילוץ.
+   */
+  let windowByLine = new Map<number, UnitWindow>();
+
+  passes.forEach((spec, passIdx) => {
+  activePass = spec;
+  activePassIndex = passIdx;
+  if (passIdx > 0) {
+    for (let i = links.length - 1; i >= 0; i--) if (links[i].isInherited) links.splice(i, 1);
+  }
+
+  if (spec.prunesConflictsBefore) {
+    const dropped = pruneConflictingAnchors(links, buildLinkUnits(commDoc.lines, links, profile));
+    if (DEBUG && dropped.length > 0) {
+      console.log(`  ✂️  M1: ${dropped.length} עוגנים סותרים נוכו (${dropped.map(l => `${l.line_index_1}→${l.line_index_2}`).join(', ')})`);
+    }
+  }
+
+  anchorByLine = new Map(links.filter(l => !l.isInherited).map(l => [l.line_index_1, l]));
+  windowByLine = new Map();
+  if (spec.scope === 'window') {
+    const units = buildLinkUnits(commDoc.lines, links, profile);
+    units.forEach((u, i) => {
+      if (u.target !== null && !u.inherited) return;
+      const w = windowForUnit(units, i);
+      if (w.lo !== null || w.hi !== null) windowByLine.set(u.lineIdx1, w);
+    });
+  }
+
+  carriedLink = null;
+  carriedInheritDepth = 0;
+  previousSecondaryType = null;
+  if (DEBUG && passes.length > 1) {
+    console.log(`\n🔁 מעבר ${passIdx + 1}/${passes.length}: '${spec.name}' (רף ${spec.minScore ?? '—'}, ${spec.fuzzy ? 'גמיש' : 'מילולי'}, היקף ${spec.scope}) — ${anchorByLine.size} עוגנים, ${windowByLine.size} חלונות`);
+  }
+
   commDoc.segments.forEach((commSeg, segIdx) => {
     if (firstAlignedSegIdx > 0 && segIdx < firstAlignedSegIdx) return;
 
-    const opensWithBaad = firstContentLineIsBaad(commDoc.lines, commSeg.startLine);
+    // בהלכה "השורה הראשונה אומרת שהיא המשך" נמדד לפי המספור: סגמנט שנפתח בשורה לא ממוספרת
+    // ממשיך את הקטע האחרון של הסגמנט הקודם, בדיוק כפי שסגמנט שנפתח בבא"ד ממשיך אותו בש"ס.
+    // כשאין ירושה כלל (מבנה 'single-line') אין מה להעביר מעבר לכותרת.
+    const opensWithBaad = !profile.allowsInheritance
+      ? false
+      : profile.numberingDrivesLinking
+        ? firstContentLineIsUnnumbered(commDoc.lines, commSeg.startLine, profile)
+        : firstContentLineIsBaad(commDoc.lines, commSeg.startLine);
     let previousLink: OtzariaLink | null = opensWithBaad ? carriedLink : null;
     // How many inheritance hops separate previousLink from the last link that was matched on
     // its own textual evidence (0 = previousLink was matched directly). Confidence decays once
@@ -2038,19 +2370,135 @@ export function runLinkingParser(
     const usedSecondaryLines: { rashi: Set<number>; tosafot: Set<number> } = { rashi: new Set(), tosafot: new Set() };
 
     // Find matching source segment
-    const srcSeg = srcDoc.segments.find(s => areHeadersMatching(commSeg.headerTitle, s.headerTitle));
-    const rashiSeg = rashiDoc ? rashiDoc.segments.find(s => areHeadersMatching(commSeg.headerTitle, s.headerTitle)) : null;
-    const tosafotSeg = tosafotDoc ? tosafotDoc.segments.find(s => areHeadersMatching(commSeg.headerTitle, s.headerTitle)) : null;
+    const srcSeg = findMatchingSegment(srcDoc.segments, commSeg.headerTitle);
+    const rashiSeg = rashiDoc ? findMatchingSegment(rashiDoc.segments, commSeg.headerTitle) || null : null;
+    const tosafotSeg = tosafotDoc ? findMatchingSegment(tosafotDoc.segments, commSeg.headerTitle) || null : null;
 
     let lastMatchedSrcLineIndex = srcSeg ? srcSeg.startLine : 1;
+
+    /**
+     * שורת אסימון ס"ק — "(א)" לבדו בשורה, או כותרת ממוספרת — פותחת ס"ק אך אין בה טקסט לחפש
+     * בו. הדגל מעביר את תפקיד הפותח לשורת התוכן הבאה, שהיא זו שנושאת את הציטוט מלשון השו"ע.
+     * מאותחל מחדש בכל סגמנט, שכן ס"ק אינו נמשך מעבר לכותרת "סימן".
+     */
+    let markerAwaitsOpener = false;
+
+    /**
+     * רצפת הסדר בתוך המעבר הנוכחי: היעד של העוגן האחרון שנראה בסגמנט הזה, בין שהיה קיים
+     * מקודם ובין שנוצר ברגע זה.
+     *
+     * `windowByLine` מחושב פעם אחת בפתח המעבר, ולכן הוא אינו יודע על עוגנים שהמעבר עצמו
+     * מוסיף תוך כדי. בלי הרצפה הזאת, יחידה שנסרקת אחרי שנוסף עוגן לפניה עדיין עובדת לפי
+     * חלון ישן ויכולה להיקשר לשורה שקודמת לו — נסיגה אחורה שנוצרת **בתוך** מעבר. זה נמצא
+     * במדידה על ספר אמיתי, אחרי שההערה בקוד טענה שהמקרה אינו אפשרי.
+     */
+    let orderFloor: number | null = null;
 
     for (let cLineIdx = commSeg.startLine; cLineIdx <= commSeg.endLine; cLineIdx++) {
       if (cLineIdx > commDoc.lines.length) break;
       const cLineRaw = commDoc.lines[cLineIdx - 1];
-      if (!cLineRaw || isHeaderLine(cLineRaw) || !cLineRaw.trim()) continue;
+      if (!cLineRaw || isHeaderLine(cLineRaw, profile) || !cLineRaw.trim()) continue;
       segmentHadContent = true;
 
-      const trimmedLine = cLineRaw.trim();
+      /**
+       * ── מבנה ס"ק: המספור הוא שמחליט מי מחפש ומי יורש ─────────────────────────────────────
+       * פותח ס"ק — שורה ממוספרת ("(א)", "ב)"), או השורה שאחרי שורת אסימון — הוא היחיד שנכנס
+       * לחיפוש; כל שורה אחרת היא המשך הדיון של אותו ס"ק ויורשת את ההקשר שלו בלי לחפש כלל.
+       * בשאר המבנים ובשאר הקטגוריות `numberingDrivesLinking` הוא false והמנגנון כולו מנוטרל.
+       */
+      const skMode = profile.numberingDrivesLinking;
+      // אסימון המספור ומילת ההפניה להגהה נחתכים מהשורה לפני כל שאר הצינור, כך שהמילה הראשונה
+      // שהמנוע רואה היא המילה הראשונה של הלמה — זה מה שנותן ל-maxDhStartIdx=2 את המשמעות שלו.
+      const trimmedLine = stripHalachaLeadIn(cLineRaw, profile).trim();
+
+      // שורת אסימון אינה קטע פירוש: היא אינה מקבלת קישור, אינה מנתקת את שרשרת הירושה,
+      // ומוסרת את תפקיד הפותח לשורה הבאה.
+      if (skMode && isSeifKatanMarkerLine(cLineRaw)) {
+        markerAwaitsOpener = true;
+        if (DEBUG) console.log(`\n🔖 Line ${cLineIdx}: אסימון ס"ק — הפותח הוא השורה הבאה`);
+        continue;
+      }
+      if (profile.stripsNumbering && !trimmedLine) continue;
+
+      /** השורה פותחת ס"ק: היא עצמה ממוספרת, או שהיא שורת התוכן שאחרי שורת אסימון. */
+      const isSeifKatanOpener = skMode && (hasHalachaNumbering(cLineRaw) || markerAwaitsOpener);
+      markerAwaitsOpener = false;
+
+      /**
+       * מעבר שני ואילך: יחידה שכבר יש לה עוגן אינה נחפשת מחדש — מעבר מוסיף ואינו משנה.
+       * מה שכן נעשה כאן הוא לקדם את מצב שרשרת הירושה בדיוק כפי שהחיפוש היה מקדם אותו, אחרת
+       * השורות שמתחת היו יורשות הקשר של שורה ישנה יותר. הקיצור נמצא **אחרי** הטיפול המבני
+       * (שורת אסימון, מספור, `markerAwaitsOpener`), כי אותו טיפול קובע מי הפותח של הס"ק הבא
+       * וחייב לרוץ בכל מעבר.
+       *
+       * `dhHighlights` אינו מחושב כאן במכוון: הערך שנרשם במעבר שמצא את העוגן הוא הנכון.
+       */
+      const existingAnchor = anchorByLine.get(cLineIdx);
+      if (existingAnchor) {
+        previousLink = existingAnchor;
+        previousInheritDepth = 0;
+        previousSecondaryType = existingAnchor.secondaryTarget || null;
+        if (!existingAnchor.secondaryTarget) {
+          lastMatchedSrcLineIndex = existingAnchor.line_index_2;
+          orderFloor = existingAnchor.line_index_2;
+        }
+        continue;
+      }
+
+      /**
+       * אילוץ החלון — וזוהי אכיפת אי-הנסיגה עצמה.
+       *
+       * במעבר בהיקף `window` תחום החיפוש נחתך לטווח שהעוגנים שמסביב מתירים, ולכן **מעבר כזה
+       * אינו יכול לייצר נסיגה אחורה — אין לו לאן**. אין צורך בבדיקת מונוטוניות נפרדת בסוף
+       * הריצה: החלון הוא הביטוי המעשי של הכלל, ולא אמצעי אכיפה נוסף עליו.
+       *
+       * הגבולות **כלולים**. סעיף אחד בשו"ע נושא לעיתים קרובות עשרה ס"ק, ולכן חלון ששני
+       * קצותיו מצביעים על אותה שורה הוא חלון תקין ברוחב 1 — המקרה הנפוץ ביותר בספר, וגבול
+       * בלעדי היה מוחק אותו.
+       *
+       * מחושב פעם אחת לשורה ומשמש את כל מסלולי החיפוש שמייצרים קישור למקור הראשי — החיפוש
+       * הרגיל, מקטעי ההמשך, סולם הגמישות ועוגן המילה הראשונה. מסלול שיישאר בהיקף הסגמנט
+       * יוכל לייצר נסיגה בדלת האחורית.
+       */
+      const segStartLine = srcSeg ? srcSeg.startLine : 1;
+      const segEndLine = srcSeg ? srcSeg.endLine : srcDoc.lines.length;
+      const unitWindow = activePass.scope === 'window' ? windowByLine.get(cLineIdx) : undefined;
+      // הרצפה נאכפת בכל מעבר ממוקד-חלון, גם כשלא נמצא חלון ליחידה הזאת בפתח המעבר: עוגן
+      // שנוסף באמצע המעבר הוא בדיוק המקרה שהחלון המוקדם אינו מכיר.
+      const floor = activePass.scope === 'window' ? orderFloor : null;
+      const lowerBounds = [segStartLine, unitWindow?.lo ?? -Infinity, floor ?? -Infinity];
+      const srcStart = Math.max(...lowerBounds);
+      const srcEnd = Math.max(srcStart, unitWindow?.hi != null ? Math.min(segEndLine, unitWindow.hi) : segEndLine);
+      if (DEBUG && unitWindow) console.log(`  🪟 שורה ${cLineIdx}: חלון [${srcStart}..${srcEnd}] מתוך [${segStartLine}..${segEndLine}]`);
+
+      /**
+       * מעבר שמותנה ברוחב חלון מדלג על יחידה שחלונה רחב מדי, או שאינו חסום משני צדדיו.
+       *
+       * דילוג ולא `continue`: השורה ממשיכה בגוף הלולאה בדיוק כמו שורה שהחיפוש בה נכשל, כדי
+       * שהירושה ומצב השרשרת יטופלו באותה דרך אחת. `continue` היה מדלג גם עליהם ומייצר מסלול
+       * שני לאותה החלטה.
+       */
+      /**
+       * הרוחב הנמדד הוא של **תחום החיפוש בפועל**, ולא של החלון שהעוגנים לבדם נותנים:
+       * גבולות הסימן הם עוגנים בזכות עצמם, ויחידה בסוף סימן שאין אחריה עוגן אינה "לא חסומה"
+       * — היא חסומה בכותרת הבאה. `UnitWindow.width` מודד את התרומה של העוגנים בלבד ולכן הוא
+       * `null` שם; מה שקובע כאן הוא כמה שורות באמת נשארו.
+       */
+      const searchRangeWidth = srcEnd - srcStart + 1;
+      const skipForWindowWidth =
+        activePass.maxWindowWidth !== undefined && searchRangeWidth > activePass.maxWindowWidth;
+      /**
+       * כמה אסימונים בלע החיתוך שבראש השורה — המספור, ומילת ההפניה להגהה. ההדגשה
+       * (dhHighlights) נמדדת מול השורה הגולמית, שבה שניהם עדיין קיימים, ולכן היא מוזזת בדיוק
+       * במספר האסימונים שנחתכו — אחרת ההדגשה הייתה נופלת עליהם במקום על הלמה.
+       */
+      const dhWordOffset = profile.stripsNumbering || profile.stripsGlossReference
+        ? Math.max(
+            0,
+            cLineRaw.trim().split(/\s+/).filter(Boolean).length -
+              trimmedLine.split(/\s+/).filter(Boolean).length
+          )
+        : 0;
       // Normalize the prefix line fully for keyword matching (includes nikud removal, quote normalization)
       const normalizedPrefixLine = normalizeText(trimmedLine, false);
 
@@ -2075,7 +2523,11 @@ export function runLinkingParser(
       let targetSecondary: 'rashi' | 'tosafot' | null = null;
       let explicitSecondaryTarget = false;
 
-      if (startsWithSourceKeyword(lineForKeywordCheck, RASHI_KEYWORDS_NORM)) {
+      // בקטגוריית הלכה אין מקורות משניים לנתב אליהם (ראו SourceProfile.hasSecondarySources):
+      // כל קישור מצביע על השו"ע עצמו, וכל מנגנון הניתוב לרש"י/תוספות מדולג.
+      if (!profile.hasSecondarySources) {
+        // אין מה לבדוק — targetSecondary נשאר null ו-explicitSecondaryTarget נשאר false.
+      } else if (startsWithSourceKeyword(lineForKeywordCheck, RASHI_KEYWORDS_NORM)) {
         targetSecondary = 'rashi';
         explicitSecondaryTarget = true;
         if (DEBUG) console.log(`  ✅ Detected Rashi keyword. normalizedPrefixLine='${normalizedPrefixLine}'`);
@@ -2131,7 +2583,14 @@ export function runLinkingParser(
       // means "ibid" and keeps auto-inheriting. Set config.inheritOnBareSham = true to restore
       // the old behavior where bare "שם" also auto-inherits without searching.
       const shamShouldInherit = isJustSham && (config as any).inheritOnBareSham === true;
-      const shouldInheritLine = isBaad || shamShouldInherit;
+      // במבנה ס"ק המספור מחליף לגמרי את שאלת "האם השורה אומרת שהיא המשך": שורה שאינה פותחת
+      // ס"ק היא המשך מעצם היעדר המספור, ופותח ס"ק פותח קטע חדש גם אם הוא כתוב בלשון בא"ד.
+      // במבנה שבו קטע פירוש הוא שורה אחת אין ירושה כלל — גם לא על בא"ד או "שם".
+      const shouldInheritLine = !profile.allowsInheritance
+        ? false
+        : skMode
+          ? !isSeifKatanOpener
+          : (isBaad || shamShouldInherit);
       let isInherited = false;
 
       // Extract DH search text using stripped line if secondary prefix present
@@ -2148,9 +2607,10 @@ export function runLinkingParser(
       // For non-explicit lines, use lineForDh or fallback to trimmedLine
       const lineForDhExtraction = lineForDh.trim() ? lineForDh : trimmedLine;
       if (DEBUG) console.log(`  🔎 lineForDhExtraction='${lineForDhExtraction}'`);
-      // Tosafot ד"ה is capped to 7 words; every other source (Rashi, Gemara, Mishna, etc.) keeps 12.
-      const maxDhWordsForTarget = targetSecondary === 'tosafot' ? 7 : 12;
-      const { dhText, cleanDh, isExplicitDelimiter } = extractDiburHamatchil(lineForDhExtraction, config.diburHamatchilDelimiter, maxDhWordsForTarget);
+      // Tosafot ד"ה is capped to 7 words; every other source (Rashi, Gemara, Mishna, etc.) keeps
+      // the profile's cap — 12 for ש"ס/תנ"ך as before, 5 for ספרי הלכה.
+      const maxDhWordsForTarget = targetSecondary === 'tosafot' ? 7 : profile.maxDhWords;
+      const { dhText, cleanDh, isExplicitDelimiter } = extractDiburHamatchil(lineForDhExtraction, config.diburHamatchilDelimiter, maxDhWordsForTarget, profile);
       if (DEBUG) console.log(`  📌 dhText='${dhText}', cleanDh='${cleanDh}', isExplicitDelimiter=${isExplicitDelimiter}`);
 
       let matchedSourceLineNum: number | null = null;
@@ -2176,7 +2636,8 @@ export function runLinkingParser(
       // the same DH pattern was already handled correctly for the primary source below via
       // searchPrimaryWithFirstAnchor. We now apply the identical First-Anchor segment search
       // to Rashi/Tosafot as well, so 'כו'-לינק'ing works consistently for every source book.
-      const hasKooSecondary = /(?:^|\s)ו?כו'(?:\s|$|[.,:;])/i.test(lineForDhExtraction) || /(?:^|\s)ו?כו'(?:\s|$|[.,:;])/i.test(trimmedLine);
+      const hasKooSecondary = profile.usesContinuationSegments &&
+        (/(?:^|\s)ו?כו'(?:\s|$|[.,:;])/i.test(lineForDhExtraction) || /(?:^|\s)ו?כו'(?:\s|$|[.,:;])/i.test(trimmedLine));
 
       // Search in secondary source if routed (unless it's 'בא"ד', in which case we don't search, we inherit)
       if (!shouldInheritLine && targetSecondary === 'rashi' && rashiDoc) {
@@ -2304,7 +2765,7 @@ export function runLinkingParser(
       }
 
       // Search in primary source segment unless the line explicitly targets a secondary source or is 'בא"ד' (which means inherit previous).
-      if (!explicitSecondaryTarget && !shouldInheritLine) {
+      if (!explicitSecondaryTarget && !shouldInheritLine && !skipForWindowWidth && activePass.mode === 'score') {
         // Bug #1 (Part 2) FIX: Ensure we only use the last PRIMARY source line for distance hint.
         // If previousLink was Rashi/Tosafot, line_index_2 is NOT a primary source index.
         const prevPrimaryLineNum = (previousLink && !previousLink.secondaryTarget)
@@ -2312,31 +2773,38 @@ export function runLinkingParser(
           : (lastMatchedSrcLineIndex || null);
 
         if (DEBUG) console.log(`🔍 Searching PRIMARY source: lineForDhExtraction='${lineForDhExtraction}', cleanDh='${cleanDh}', isExplicit=${isExplicitDelimiter}`);
-        const hasKoo = /(?:^|\s)ו?כו'(?:\s|$|[.,:;])/i.test(lineForDhExtraction) || /(?:^|\s)ו?כו'(?:\s|$|[.,:;])/i.test(trimmedLine);
+
+
+        // גישת מקטעי ההמשך כבויה בספרי הלכה: שם "כו'" כבר סגר את הד"ה בחילוץ עצמו, ומה
+        // שלפניו הוא העוגן. ראו findDhBoundary ב-halachaAlgorithm.
+        const hasKoo = profile.usesContinuationSegments &&
+          (/(?:^|\s)ו?כו'(?:\s|$|[.,:;])/i.test(lineForDhExtraction) || /(?:^|\s)ו?כו'(?:\s|$|[.,:;])/i.test(trimmedLine));
         if (hasKoo) {
           if (DEBUG) console.log(`  🎯 Applying First Anchor Priority for primary source with כו' / וכו'`);
           srcMatchRes = searchPrimaryWithFirstAnchor(
             srcDoc.lines,
-            srcSeg ? srcSeg.startLine : 1,
-            srcSeg ? srcSeg.endLine : srcDoc.lines.length,
+            srcStart,
+            srcEnd,
             lineForDhExtraction,
             srcIdfMap,
             prevPrimaryLineNum,
             false,
-            srcLineCache
+            srcLineCache,
+            maxDhWordsForTarget
           );
         } else {
           srcMatchRes = searchLineInDoc(
             srcDoc.lines,
-            srcSeg ? srcSeg.startLine : 1,
-            srcSeg ? srcSeg.endLine : srcDoc.lines.length,
+            srcStart,
+            srcEnd,
             cleanDh,
             lineForDhExtraction,
             isExplicitDelimiter,
             srcIdfMap,
             prevPrimaryLineNum,
             false,
-            srcLineCache
+            srcLineCache,
+            maxDhWordsForTarget
           );
         }
         if (DEBUG) console.log(`  → PRIMARY source result: lineNum=${srcMatchRes.lineNum}, matchedCount=${srcMatchRes.matchedCount}`);
@@ -2348,8 +2816,8 @@ export function runLinkingParser(
           if (DEBUG) console.log(`  🪜 Primary-source strict search failed for explicit citation — trying flexibility ladder`);
           const ladderOutcome = attemptFlexibleRetry(
             srcDoc.lines,
-            srcSeg ? srcSeg.startLine : 1,
-            srcSeg ? srcSeg.endLine : srcDoc.lines.length,
+            srcStart,
+            srcEnd,
             srcDoc.segments,
             cleanDh,
             lineForDhExtraction,
@@ -2357,7 +2825,7 @@ export function runLinkingParser(
             srcIdfMap,
             prevPrimaryLineNum,
             srcLineCache,
-            12
+            maxDhWordsForTarget
           );
           if (ladderOutcome) {
             srcMatchRes = ladderOutcome.result;
@@ -2404,35 +2872,63 @@ export function runLinkingParser(
       // ── Single-word Dibur Hamatchil: the first-word anchor ───────────────────────────────
       // Last resort before inheritance. Fires only when NOTHING was found above — see the
       // policy note at the top of this file for what it does and why it has to exist.
-      if (!matchedSourceLineNum && !matchedSecondaryLineNum && !shouldInheritLine) {
+      if (!matchedSourceLineNum && !matchedSecondaryLineNum && !shouldInheritLine && !skipForWindowWidth) {
         const swTargetDoc: 'rashi' | 'tosafot' | 'primary' =
           targetSecondary === 'rashi' ? 'rashi' : targetSecondary === 'tosafot' ? 'tosafot' : 'primary';
         const swDocLines =
           swTargetDoc === 'rashi' ? rashiDoc?.lines : swTargetDoc === 'tosafot' ? tosafotDoc?.lines : srcDoc.lines;
         const swCache =
           swTargetDoc === 'rashi' ? rashiLineCache : swTargetDoc === 'tosafot' ? tosafotLineCache : srcLineCache;
-        const swSeg = swTargetDoc === 'rashi' ? rashiSeg : swTargetDoc === 'tosafot' ? tosafotSeg : srcSeg;
+        // המקור הראשי נסרק בגבולות החלון, כמו כל מסלול אחר שמייצר קישור אליו.
+        const swSeg = swTargetDoc === 'rashi' ? rashiSeg : swTargetDoc === 'tosafot' ? tosafotSeg
+          : (srcSeg ? { ...srcSeg, startLine: srcStart, endLine: srcEnd } : srcSeg);
         const swIdf = swTargetDoc === 'rashi' ? rashiIdfMap : swTargetDoc === 'tosafot' ? tosafotIdfMap : srcIdfMap;
 
-        // The anchor: first word of the ד"ה, exactly as written — no prefix letters removed.
+        // The anchor: the opening of the ד"ה, exactly as written — no prefix letters removed.
         const swWords = (cleanDh || normalizeText(lineForDhExtraction)).split(/\s+/).filter(Boolean);
-        const anchor = swWords[0] || '';
-        const anchorLetters = anchor.replace(/[^א-ת]/g, '');
 
-        if (
-          anchorLetters.length >= SWDH_MIN_LETTERS &&
-          !HEBREW_STOP_WORDS.has(anchorLetters) &&
-          swdhOpeningRatio(anchor) <= SWDH_MAX_OPENING_RATIO &&
-          swDocLines && swSeg
-        ) {
+        /**
+         * ── עוגן ייחודי: מילה עד שלוש ────────────────────────────────────────────────────
+         *
+         * הנתיב הזה אינו שוקל משקלים כלל — הוא נשען על **ייחודיות**, ולכן הוא מצליח בדיוק
+         * במקום שהרף נכשל בו. "יש אומרים" מקבל ציון 0.70 ונופל בכל חישוב משקל, אבל אם הצירוף
+         * המדויק מופיע פעם אחת בתחום החיפוש — זו ראיה מצוינת.
+         *
+         * מנסים מן הארוך אל הקצר: יותר מילים = יותר ראיה, וגם סיכוי גדול בהרבה שהצירוף ייחודי.
+         *
+         * **שער הנדירות חל רק על עוגן של מילה אחת.** הוא קיים כדי לפסול מילה שהמחבר רגיל
+         * לפתוח בה שורות ("והנה", "ובזה") — וצירוף בן שתיים-שלוש מילים אינו הרגל לשון אלא
+         * ציטוט. זה כלל ולא כוונון, ולכן אינו שדה ברשומה.
+         *
+         * תחום החיפוש הוא החלון (`swSeg` נחתך אליו למעלה), ולכן "ייחודי" נמדד בתוך מה
+         * שהעוגנים שמסביב הותירו — וזה מה שהופך את הנתיב לשמיש בשו"ע, שבו מילת מפתח חוזרת
+         * בסימן שוב ושוב וייחודיות על פני הסימן כולו כמעט אינה מתקיימת.
+         */
+        const maxAnchorWords = Math.min(activePass.uniqueAnchorMaxWords, swWords.length);
+
+        for (let n = maxAnchorWords; n >= 1 && !matchedSourceLineNum; n--) {
+          const anchorWords = swWords.slice(0, n);
+          const anchor = anchorWords.join(' ');
+          const anchorLetters = anchor.replace(/[^א-ת]/g, '');
+          if (anchorLetters.length < SWDH_MIN_LETTERS || !swDocLines || !swSeg) continue;
+          if (n === 1 && (HEBREW_STOP_WORDS.has(anchorLetters) ||
+                          swdhOpeningRatio(anchor) > profile.swdhMaxOpeningRatio)) continue;
+
           // Plain string equality on the normalised form. Nothing else.
           const to = Math.min(swSeg.endLine, swDocLines.length);
           let hit = 0;
           let hits = 0;
           for (let l = swSeg.startLine; l <= to; l++) {
-            const words = swCache?.[l - 1]?.words;
+            const entry = swCache?.[l - 1];
+            const words = entry?.words;
             if (!words || words.length === 0) continue;
-            if (swTargetDoc === 'primary' ? words.includes(anchor) : words[0] === anchor) {
+            const found = n === 1
+              ? (swTargetDoc === 'primary' ? words.includes(anchor) : words[0] === anchor)
+              // צירוף נבדק כרצף מילים שלמות, כדי ש"מים" לא ייתפס בתוך "מימיו".
+              : (swTargetDoc === 'primary'
+                  ? ` ${entry!.norm} `.includes(` ${anchor} `)
+                  : `${entry!.norm} `.startsWith(`${anchor} `));
+            if (found) {
               hits++;
               if (hits === 1) hit = l;
               else break; // a second hit already disqualifies the anchor
@@ -2440,30 +2936,31 @@ export function runLinkingParser(
           }
 
           if (hits === 1) {
-            const anchorWeight = getCombinedWordWeight(anchor, enableWordWeighting, swIdf);
+            const anchorWeight = anchorWords
+              .reduce((s, w) => s + getCombinedWordWeight(w, enableWordWeighting, swIdf), 0);
             const windowWeight = swWords
               .slice(0, maxDhWordsForTarget)
               .reduce((s, w) => s + getCombinedWordWeight(w, enableWordWeighting, swIdf), 0);
             const swResult: SearchResult = {
               lineNum: hit,
-              matchedCount: 1,
-              matchedWordCount: 1,
+              matchedCount: n,
+              matchedWordCount: n,
               expectedWeight: windowWeight,
               topK: [{ lineNum: hit, score: anchorWeight }],
               evidence: {
                 matchedWeight: anchorWeight,
                 windowWeight: windowWeight || anchorWeight,
-                runWords: 1,
-                simSum: 1,
+                runWords: n,
+                simSum: n,
                 winnerScore: anchorWeight,
                 // Uniqueness is enforced above, so there is no rival by construction.
                 runnerUpScore: 0,
-                // One word is not a phrase; claiming a verbatim phrase match here would
-                // inflate the reported confidence of the thinnest evidence the engine accepts.
-                exactPhrase: false
+                // מילה בודדת אינה ביטוי, וסימונה כציטוט מילולי היה מנפח את הוודאות המדווחת
+                // של הראיה הדקה ביותר שהמנוע מקבל. צירוף בן שתיים ומעלה כן נמצא כלשונו.
+                exactPhrase: n > 1
               }
             };
-            if (DEBUG) console.log(`  ⚓ First-word anchor '${anchor}' → ${swTargetDoc} line ${hit}`);
+            if (DEBUG) console.log(`  ⚓ עוגן ייחודי (${n} מילים) '${anchor}' → ${swTargetDoc} שורה ${hit}`);
 
             if (swTargetDoc === 'primary') {
               srcMatchRes = swResult;
@@ -2499,8 +2996,11 @@ export function runLinkingParser(
       // if its own (post-strip) text doesn't find a match, the line should sever the
       // inheritance chain (no link at all) rather than falling back to reuse the previous
       // link, so a later line can't silently inherit through it.
+      // בהלכה פותח הס"ק עומד על ראיות משלו בלבד: אם החיפוש שלו נכשל הוא נשאר בלי קישור,
+      // ואינו מכסה על הכישלון בירושה מקטע קודם שאין בינו לבינו דבר. במבנה שבו קטע פירוש הוא
+      // שורה אחת (allowsInheritance=false) אין ירושה כזאת כלל.
       const isBareShamNoInherit = isJustSham && !shamShouldInherit;
-      if (!matchedSourceLineNum && !explicitSecondaryTarget && !explicitPrimaryTarget && !isBareShamNoInherit && previousLink && previousLink.line_index_2) {
+      if (!matchedSourceLineNum && profile.allowsInheritance && !isSeifKatanOpener && !explicitSecondaryTarget && !explicitPrimaryTarget && !isBareShamNoInherit && previousLink && previousLink.line_index_2) {
         matchedSourceLineNum = previousLink.line_index_2;
         matchedSecondaryLineNum = previousLink.secondary_line_index || null;
         targetSecondary = previousLink.secondaryTarget || null;
@@ -2577,7 +3077,9 @@ export function runLinkingParser(
           inheritedFrom: previousLink?.confidence,
           isExplicit: isExplicitDelimiter,
           retryRung: retryRungForConfidence,
-          evidence: producingRes.evidence
+          evidence: producingRes.evidence,
+          passIndex: activePassIndex,
+          searchRangeWidth
         });
         // Calibration tap. Inert unless a harness has installed the sink — the optional call
         // costs one property read per link and the array does not exist in the app. It is the
@@ -2631,6 +3133,8 @@ export function runLinkingParser(
           confidence: calculateLinkConfidence({
             isExplicit: isExplicitDelimiter,
             retryRung: retryRungForConfidence,
+            passIndex: activePassIndex,
+            searchRangeWidth,
             evidence: candidateEvidence(
               c.score,
               rawTopK.reduce((best, o, j) => (j === i ? best : Math.max(best, o.score)), 0)
@@ -2663,10 +3167,21 @@ export function runLinkingParser(
         };
 
         links.push(newLink);
+        // מעבר מאוחר עשוי למצוא עוגן לשורה שקיבלה קישור מורש במעבר קודם. הירושה כבר נמחקה
+        // בפתח המעבר, ולכן במקרה הזה אין כפילות — אבל השמירה כאן מגנה גם על סדר אחר.
+        if (!isInherited) {
+          anchorByLine.set(cLineIdx, newLink);
+          if (!targetSecondary) orderFloor = matchedSourceLineNum;
+        }
         previousLink = newLink;
         // A link matched on its own evidence restarts the chain; an inherited one extends it.
         previousInheritDepth = isInherited ? previousInheritDepth + 1 : 0;
         previousSecondaryType = targetSecondary;
+      } else if (skMode) {
+        // במבנה ס"ק כישלון של פותח ס"ק אינו מנתק את השרשרת: previousLink נשאר על הקישור
+        // המוצלח האחרון, כך שההמשכים שמתחתיו עדיין יורשים אותו במקום להישאר יתומים. הכלל
+        // של ש"ס (ניתוק בכל שורה בלי קישור) נשען על כך שכל שורה שם היא מועמדת לחיפוש; כאן
+        // רוב השורות ממילא אינן מחפשות, ולכן ניתוק היה מוחק קטעים שלמים בגלל כישלון בודד.
       } else {
         // Rule: a content line that ends up with NO link at all breaks the inheritance chain.
         // Without this, a later line (e.g. line 6) could silently inherit a link from an
@@ -2687,7 +3202,7 @@ export function runLinkingParser(
       }
 
       dhHighlights[cLineIdx] = {
-        wordStart: 0,
+        wordStart: dhWordOffset,
         wordCount: Math.max(1, Math.min(dhWordCount, wordsInLine.length))
       };
     }
@@ -2701,6 +3216,36 @@ export function runLinkingParser(
     }
   });
 
+  }); // passes
+
+  /**
+   * ── מילוי פערים בין שני עוגנים זהים ────────────────────────────────────────────────────
+   * שני קטעי פירוש שנמצאו — כל אחד בזכות עצמו — כנגד אותה שורת מקור, כולאים ביניהם קטע שהחיפוש
+   * לא מצא לו דבר. הכליאה עצמה היא הראיה: הפירוש עובר על המקור לפי סדרו, וקטע שיושב בין שני
+   * קטעים שדנים באותה שורה דן בה גם הוא. לכן הוא מקבל את אותה שורה, מסומן כירושה (הקישור אינו
+   * נשען על ראיות טקסטואליות משלו) ובוודאות שנגזרת מן העוגן שכלא אותו.
+   *
+   * רק עוגן אמיתי — קישור שלא נורש בעצמו — סוגר פער; שורות שכבר ירשו הקשר אינן משנות דבר,
+   * שכן הן ממילא מצביעות על היעד של העוגן שמעליהן. הפער אינו חוצה כותרת "סימן": מעברה מדובר
+   * בסימן אחר בשו"ע, ואין שום משמעות לכליאה בין שני צדדיו.
+   */
+  if (profile.fillsGapsBetweenEqualAnchors) {
+    const filled = fillGapsBetweenEqualAnchors({
+      links,
+      commLines: commDoc.lines,
+      segments: commDoc.segments,
+      firstSegIdx: Math.max(0, firstAlignedSegIdx),
+      sourceLines: srcDoc.lines,
+      dhHighlights,
+      profile
+    });
+    if (filled.length > 0) {
+      if (DEBUG) console.log(`  🌉 מילוי פערים: ${filled.length} שורות קיבלו קישור מן העוגנים שסביבן`);
+      links.push(...filled);
+      links.sort((a, b) => a.line_index_1 - b.line_index_1);
+    }
+  }
+
   return {
     links,
     commentaryLines: commDoc.lines,
@@ -2709,6 +3254,283 @@ export function runLinkingParser(
     tosafotLines: tosafotDoc?.lines,
     dhHighlights
   };
+}
+
+/**
+ * Whether a commentary line takes part in linking at all under `profile` — the same set of
+ * skips the linking loop performs before it decides link / no link. Kept next to the loop so a
+ * later pass over the same document (the gap filling below) does not count a structural line as
+ * a piece that failed to find its source.
+ */
+export function isLinkableContentLine(rawLine: string, profile: SourceProfile): boolean {
+  if (!rawLine || !rawLine.trim()) return false;
+  if (isHeaderLine(rawLine, profile)) return false;
+  if (profile.numberingDrivesLinking && isSeifKatanMarkerLine(rawLine)) return false;
+  if (profile.stripsNumbering && !stripHalachaNumbering(rawLine).trim()) return false;
+  return true;
+}
+
+/**
+ * ── יחידות וחלונות ─────────────────────────────────────────────────────────────────────────
+ *
+ * **יחידה** היא שורת פירוש שהפרופיל מכניס לחיפוש — במבנה ס"ק פותח ס"ק, ובשאר המבנים כל שורת
+ * תוכן. **החלון** של יחידה הוא טווח שורות המקור שעדיין אפשריות עבורה, כפי ששכניה המקושרים
+ * כולאים אותו משני צדדיו.
+ *
+ * שני הכללים שהתוכנית נשענת עליהם הם למעשה כלל אחד: מעבר שמחפש רק בתוך החלון אינו יכול
+ * לייצר נסיגה אחורה, ולכן אין צורך בבדיקת מונוטוניות נפרדת בסוף. ראו
+ * docs/HALACHA_MULTIPASS_PLAN.md סעיף 2.
+ *
+ * הקוד הזה הוא **העותק היחיד** של הכלל: גם מנוע המעברים וגם דוח המדידה (qa/halacha.metrics.ts)
+ * קוראים לו, מאותו טעם ש-`continuesByProfile` הוא עותק יחיד — שני עותקים של אותו כלל סוטים
+ * זה מזה, וכאן הסטייה הייתה מייצרת דוח שמודד ספר אחר מזה שהמנוע עיבד.
+ */
+export interface LinkUnit {
+  /** מספר השורה בקובץ הפירוש (1-based). */
+  lineIdx1: number;
+  /** מונה הסגמנט. גבול-סגמנט (כותרת "סימן") מאפס את מניית הסדר ואת החלונות. */
+  segment: number;
+  /** שורת המקור שקושרה, או null. */
+  target: number | null;
+  /** הקישור נורש (שם / בא"ד / המשך ס"ק / מילוי פער) ולא נמצא בזכות עצמו. */
+  inherited: boolean;
+}
+
+/** גבולות החיפוש שיחידה ירשה משכניה. `null` בצד כלשהו = אינו חסום. */
+export interface UnitWindow {
+  /** אין לרדת מתחת לשורה הזאת — העוגן הקרוב שמעל, באותו סגמנט. */
+  lo: number | null;
+  /** אין לעלות מעליה — העוגן הקרוב שמתחת. */
+  hi: number | null;
+  /** רוחב בשורות, מוגדר רק כששני הצדדים חסומים. רוחב 1 = הוכרע בלי ראיה טקסטואלית. */
+  width: number | null;
+}
+
+/** רשימת היחידות של מסמך הפירוש, לפי סדרן, עם התוצאה שכל אחת קיבלה. */
+export function buildLinkUnits(
+  commentaryLines: string[],
+  links: OtzariaLink[],
+  profile: SourceProfile
+): LinkUnit[] {
+  const byLine = new Map(links.map(l => [l.line_index_1, l]));
+  const units: LinkUnit[] = [];
+  let segment = 0;
+
+  commentaryLines.forEach((raw, i) => {
+    // בפרופיל הלכה רק כותרת "סימן" מחזירה true כאן — כותרת ממוספרת היא שורת תוכן.
+    if (isHeaderLine(raw, profile)) { segment++; return; }
+    if (!isLinkableContentLine(raw, profile)) return;
+    const link = byLine.get(i + 1);
+    units.push({
+      lineIdx1: i + 1,
+      segment,
+      target: link ? link.line_index_2 : null,
+      inherited: Boolean(link?.isInherited)
+    });
+  });
+
+  return units;
+}
+
+/**
+ * החלון של היחידה במקום `idx`.
+ *
+ * **רק עוגן אמיתי סוגר חלון** — קישור שנורש בעצמו אינו ראיה עצמאית, ולכן אינו משמש גבול.
+ * זהו אותו סייג שמילוי הפערים כבר עושה (`fillGapsBetweenEqualAnchors`), ומאותה סיבה: בלעדיו
+ * הכלל היה מגשים את עצמו — רצף השורות שמתחת לכישלון היה "כלוא" בין שני עותקים של אותו קישור
+ * מורש, והחלון היה מודד את הכישלון שהוא אמור לפתור.
+ *
+ * **הגבולות כלולים.** סעיף אחד בשו"ע נושא לעיתים קרובות עשרה ס"ק, ולכן חלון שקצותיו מצביעים
+ * על אותה שורה הוא חלון תקין ברוחב 1 — המקרה הנפוץ ביותר בספר. גבול בלעדי היה מוחק אותו.
+ */
+export function windowForUnit(units: LinkUnit[], idx: number): UnitWindow {
+  const segment = units[idx].segment;
+  let lo: number | null = null;
+  let hi: number | null = null;
+
+  for (let i = idx - 1; i >= 0 && units[i].segment === segment; i--) {
+    if (units[i].target !== null && !units[i].inherited) { lo = units[i].target; break; }
+  }
+  for (let i = idx + 1; i < units.length && units[i].segment === segment; i++) {
+    if (units[i].target !== null && !units[i].inherited) { hi = units[i].target; break; }
+  }
+
+  return { lo, hi, width: lo === null || hi === null ? null : Math.max(1, hi - lo + 1) };
+}
+
+/**
+ * משקל הראיה של עוגן, לצורך M1 — ציון הדירוג של השורה שנבחרה, כפי שהמנוע עצמו חישב אותו.
+ *
+ * **בכוונה לא `confidence`.** אחוז הוודאות הוא ערך תצוגה שאינו מוזן חזרה למנוע (ראו הערת
+ * מודל ה-confidence בראש הקובץ), ושימוש בו כאן היה שובר בדיוק את ההפרדה הזאת.
+ */
+function anchorEvidenceWeight(link: OtzariaLink): number {
+  const cands = link.candidates;
+  if (!cands || cands.length === 0) return 1;
+  const own = cands.find(c => c.lineNum === link.line_index_2);
+  return own ? own.score : cands.reduce((best, c) => Math.max(best, c.score), 0) || 1;
+}
+
+/**
+ * ── M1: ניכוי עוגנים סותרים ─────────────────────────────────────────────────────────────────
+ *
+ * מעברי העוגן סורקים את הסימן כולו בלי אילוץ סדר, כי בשלב שהם רצים בו אין עדיין נקודות
+ * קבועות שאפשר להיתלות בהן. לכן ייתכן שבסופם עוגן אחד סותר את שכניו — מצביע על שורה הקודמת
+ * לזו של הס"ק שלפניו, מה שאינו אפשרי כשהפירוש עובר על השו"ע לפי סדרו.
+ *
+ * **זהו הצעד הקריטי בכל התוכנית.** עוגן שגוי אינו קישור שגוי אחד: הוא קובע את החלון לכל מה
+ * שסביבו ודוחף רצף שלם של ס"ק לטווח הלא נכון. שגיאה אחת הופכת לעשר.
+ *
+ * הפתרון: בכל סגמנט נשמרת **תת-הסדרה הכבדה ביותר שאינה יורדת**, והשאר נזרק. הבחירה לפי משקל
+ * הראיה — ולא לפי סדר הגילוי — היא מה שמבטיח שהעוגן שנזרק הוא החלש מבין הסותרים ולא המאוחר
+ * שבהם. `n` הוא מספר היחידות בסימן (עשרות), ולכן DP ריבועי הוא זול לחלוטין.
+ *
+ * "אינה יורדת" ולא "עולה ממש": סעיף אחד בשו"ע נושא לעיתים קרובות עשרה ס"ק, ודרישת עלייה
+ * ממש הייתה מוחקת את המקרה הנפוץ ביותר בספר.
+ *
+ * מחזיר את הקישורים שנזרקו.
+ */
+export function pruneConflictingAnchors(links: OtzariaLink[], units: LinkUnit[]): OtzariaLink[] {
+  const byLine = new Map(links.map(l => [l.line_index_1, l]));
+  const dropped: OtzariaLink[] = [];
+
+  const segments = new Map<number, LinkUnit[]>();
+  for (const u of units) {
+    if (u.target === null || u.inherited) continue;
+    const list = segments.get(u.segment);
+    if (list) list.push(u); else segments.set(u.segment, [u]);
+  }
+
+  for (const anchors of segments.values()) {
+    if (anchors.length < 2) continue;
+
+    const w = anchors.map(a => {
+      const link = byLine.get(a.lineIdx1);
+      return link ? anchorEvidenceWeight(link) : 1;
+    });
+    const best = new Array<number>(anchors.length);
+    const prev = new Array<number>(anchors.length).fill(-1);
+    let endIdx = 0;
+
+    for (let i = 0; i < anchors.length; i++) {
+      best[i] = w[i];
+      for (let j = 0; j < i; j++) {
+        if (anchors[j].target! <= anchors[i].target! && best[j] + w[i] > best[i]) {
+          best[i] = best[j] + w[i];
+          prev[i] = j;
+        }
+      }
+      if (best[i] > best[endIdx]) endIdx = i;
+    }
+
+    const keep = new Set<number>();
+    for (let i = endIdx; i !== -1; i = prev[i]) keep.add(i);
+
+    anchors.forEach((a, i) => {
+      if (keep.has(i)) return;
+      const link = byLine.get(a.lineIdx1);
+      if (!link) return;
+      const at = links.indexOf(link);
+      if (at !== -1) links.splice(at, 1);
+      dropped.push(link);
+    });
+  }
+
+  return dropped;
+}
+
+/** The target a link points at, as one comparable value. Two links with the same key agree. */
+function linkTargetKey(link: OtzariaLink): string {
+  return `${link.line_index_2}|${link.secondaryTarget || ''}|${link.secondary_line_index || ''}`;
+}
+
+/**
+ * Links for the linkless commentary lines that sit between two links pointing at the SAME target
+ * line — see the note at the call site for why such a line belongs to that target. Returns only
+ * the new links; nothing already linked is touched.
+ *
+ * Only a link matched on its own evidence (`isInherited` falsy) can bound a gap. An inherited
+ * link merely repeats the anchor above it, so letting one close a gap would make the rule
+ * self-fulfilling: the run of lines under a failed piece would be "bounded" by two copies of the
+ * same inherited target and swallow the failure instead of reporting it.
+ */
+function fillGapsBetweenEqualAnchors(params: {
+  links: OtzariaLink[];
+  commLines: string[];
+  segments: HeaderSegment[];
+  firstSegIdx: number;
+  sourceLines: string[];
+  dhHighlights: Record<number, DHHighlight>;
+  profile: SourceProfile;
+}): OtzariaLink[] {
+  const { links, commLines, segments, firstSegIdx, sourceLines, dhHighlights, profile } = params;
+  const linkByLine = new Map(links.map(l => [l.line_index_1, l]));
+  const created: OtzariaLink[] = [];
+
+  /** The line's own Dibur Hamatchil, as the parser marked it — a gap-filled line still has one. */
+  const dhTextOf = (lineIdx1: number): string | undefined => {
+    const highlight = dhHighlights[lineIdx1];
+    if (!highlight) return undefined;
+    const words = (commLines[lineIdx1 - 1] || '').split(/\s+/).filter(Boolean);
+    const picked = words.slice(highlight.wordStart, highlight.wordStart + highlight.wordCount);
+    return picked.length > 0 ? picked.join(' ') : undefined;
+  };
+
+  const fill = (lineIdx1: number, anchor: OtzariaLink): OtzariaLink => {
+    const dhText = dhTextOf(lineIdx1);
+    // The anchor's target text, so the highlight is re-derived against the line actually linked
+    // to rather than copied from the anchor, whose Dibur Hamatchil is a different quote.
+    const targetText = anchor.secondaryTarget ? '' : (sourceLines[anchor.line_index_2 - 1] || '');
+    const confidence = calculateLinkConfidence({
+      isInherited: true,
+      inheritDepth: 1,
+      inheritedFrom: anchor.confidence
+    });
+    return {
+      line_index_1: lineIdx1,
+      line_index_2: anchor.line_index_2,
+      heRef_2: anchor.heRef_2,
+      path_2: anchor.path_2,
+      connection_type: 'commentary',
+      secondaryTarget: anchor.secondaryTarget,
+      secondary_line_index: anchor.secondary_line_index,
+      secondaryRef: anchor.secondaryRef,
+      isInherited: true,
+      dhText,
+      confidence,
+      status: confidence >= 85 ? 'approved' : 'pending',
+      matchRange: (dhText && targetText) ? (findSourceMatchRange(targetText, dhText) || undefined) : undefined
+    };
+  };
+
+  segments.forEach((seg, segIdx) => {
+    if (segIdx < firstSegIdx) return;
+
+    let anchor: OtzariaLink | null = null;
+    let pending: number[] = [];
+
+    for (let lineIdx1 = seg.startLine; lineIdx1 <= Math.min(seg.endLine, commLines.length); lineIdx1++) {
+      const raw = commLines[lineIdx1 - 1];
+      if (!isLinkableContentLine(raw, profile)) continue;
+
+      const link = linkByLine.get(lineIdx1);
+      if (!link) {
+        pending.push(lineIdx1);
+        continue;
+      }
+      // A line that inherited its context is neither an anchor nor a gap: it already points
+      // where the anchor above it points.
+      if (link.isInherited) continue;
+
+      if (anchor && pending.length > 0 && linkTargetKey(link) === linkTargetKey(anchor)) {
+        pending.forEach(gapLine => created.push(fill(gapLine, anchor!)));
+      }
+      anchor = link;
+      pending = [];
+    }
+  });
+
+  return created;
 }
 
 /**
@@ -2897,4 +3719,82 @@ export function formatLineWithDH(line: string, highlight?: DHHighlight, customId
     console.error('Error in formatLineWithDH:', e);
     return line;
   }
+}
+
+/** Pulls a stored span back inside a line that lost words to markup stripping. */
+function clampHighlight(highlight: DHHighlight, line: string): DHHighlight {
+  const lineWordCount = line.split(/\s+/).filter(Boolean).length;
+  if (lineWordCount === 0) return { wordStart: 0, wordCount: 0 };
+  const wordStart = Math.max(0, Math.min(highlight.wordStart, lineWordCount - 1));
+  return {
+    wordStart,
+    wordCount: Math.max(1, Math.min(highlight.wordCount, lineWordCount - wordStart))
+  };
+}
+
+/**
+ * Brings a session saved BEFORE markup was stripped at ingestion in line with one parsed today.
+ *
+ * The stored lines can simply be cleaned, but `dhHighlights` and `matchRange` cannot be carried
+ * over with them: both are token indices into the stored line, and dropping an
+ * `<i data-commentator=…></i>` removes tokens, so every index past one of them shifts. They are
+ * re-derived from the ד"ה that produced them in the first place — the same `findSourceMatchRange`
+ * call the parser and the manual editor make — rather than dropped, so the editor is not left
+ * recomputing every range on every render of a שולחן ערוך-sized document.
+ *
+ * Returns the session untouched when nothing needed stripping: that is every session parsed
+ * after this change (`parseDocumentSegments` cleaned it already) and every corpus that carries
+ * no markup, so the re-derivation can never disturb a session that has nothing to migrate.
+ */
+export function sanitizeSessionMarkup(session: SessionState): SessionState {
+  const cleanDoc = (lines: string[]): string[] =>
+    lines.map(line => (HEADER_TAG_RE.test(line) ? line : stripContentMarkup(line)));
+
+  const commentaryLines = cleanDoc(session.commentaryLines);
+  const sourceLines = cleanDoc(session.sourceLines);
+  const rashiLines = session.rashiLines ? cleanDoc(session.rashiLines) : session.rashiLines;
+  const tosafotLines = session.tosafotLines ? cleanDoc(session.tosafotLines) : session.tosafotLines;
+
+  const differs = (before?: string[], after?: string[]) =>
+    !!before && !!after && before.some((line, i) => line !== after[i]);
+
+  const commentaryChanged = differs(session.commentaryLines, commentaryLines);
+  const targetsChanged =
+    differs(session.sourceLines, sourceLines) ||
+    differs(session.rashiLines, rashiLines) ||
+    differs(session.tosafotLines, tosafotLines);
+
+  if (!commentaryChanged && !targetsChanged) return session;
+
+  const links = !targetsChanged ? session.links : session.links.map(link => {
+    // A link with no stored range is already recomputed on the fly by the renderer, and one
+    // with no ד"ה has nothing to recompute from.
+    if (!link.matchRange || !link.dhText) return link;
+    const targetLines = link.secondaryTarget
+      ? (link.secondaryTarget === 'rashi' ? rashiLines : tosafotLines)
+      : sourceLines;
+    const targetLineIdx1 = link.secondaryTarget
+      ? (link.secondary_line_index ?? link.line_index_2)
+      : link.line_index_2;
+    const targetText = targetLines?.[targetLineIdx1 - 1] || '';
+    return { ...link, matchRange: findSourceMatchRange(targetText, link.dhText) || undefined };
+  });
+
+  let dhHighlights = session.dhHighlights;
+  if (commentaryChanged && dhHighlights) {
+    const dhTextByLine = new Map(session.links.map(link => [link.line_index_1, link.dhText]));
+    const remapped: Record<number, DHHighlight> = {};
+    for (const [key, highlight] of Object.entries(dhHighlights)) {
+      const lineIdx1 = Number(key);
+      const line = commentaryLines[lineIdx1 - 1] || '';
+      const dhText = dhTextByLine.get(lineIdx1);
+      const rederived = dhText ? findSourceMatchRange(line, dhText) : null;
+      // A line with no link has no ד"ה to re-find: its span is the parser's opening-words
+      // guess, so clamping it to the shortened line keeps it pointing at real words.
+      remapped[lineIdx1] = rederived ?? clampHighlight(highlight, line);
+    }
+    dhHighlights = remapped;
+  }
+
+  return { ...session, commentaryLines, sourceLines, rashiLines, tosafotLines, links, dhHighlights };
 }

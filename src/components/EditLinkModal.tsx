@@ -1,7 +1,8 @@
 import React, { useState, useMemo, useEffect, useRef } from 'react';
 import { OtzariaLink } from '../types';
 import { X, Check, Trash2, ArrowLeftRight, Search, CheckCircle2, Layers, BookOpen, Bookmark, Filter, ChevronDown } from 'lucide-react';
-import { parseDocumentSegments, areHeadersMatching } from '../utils/parserAlgorithm';
+import { parseDocumentSegments, findMatchingSegment } from '../utils/parserAlgorithm';
+import { SourceProfile } from '../utils/halachaAlgorithm';
 
 interface EditLinkModalProps {
   commLineIndex: number; // 1-based
@@ -14,6 +15,12 @@ interface EditLinkModalProps {
   tosafotLines?: string[];
   targetBookName?: string;
   isShas: boolean;
+  /**
+   * פרופיל המקור של הסשן. חלוקת המסמך לסגמנטים חייבת להיות זו שהמנוע עשה — בספרי הלכה שורת
+   * ס"ק שנכתבה כ-`<h4>(ב) ...</h4>` אינה כותרת אלא שורת תוכן, ובלי הפרופיל היא הייתה יוצרת
+   * כאן "סימן" מדומה שאין לו מקבילה בשו"ע, והחלון היה מציג את הטווח השגוי.
+   */
+  profile?: SourceProfile;
   /**
    * How many commentary lines the save will land on. Above 1 the user picked a run of rows in the
    * list and every one of them takes the target chosen here; the modal itself works the same.
@@ -34,6 +41,7 @@ export const EditLinkModal: React.FC<EditLinkModalProps> = ({
   tosafotLines = [],
   targetBookName = 'גמרא',
   isShas,
+  profile,
   bulkLineCount = 1,
   onSave,
   onClose,
@@ -59,25 +67,25 @@ export const EditLinkModal: React.FC<EditLinkModalProps> = ({
   // 1. Find segment for current commentary line
   const commSeg = useMemo(() => {
     if (!commentaryLines || commentaryLines.length === 0) return null;
-    const { segments } = parseDocumentSegments(commentaryLines.join('\n'));
+    const { segments } = parseDocumentSegments(commentaryLines.join('\n'), profile);
     return segments.find(s => commLineIndex >= s.startLine && commLineIndex <= s.endLine) || null;
-  }, [commentaryLines, commLineIndex]);
+  }, [commentaryLines, commLineIndex, profile]);
 
   // 2. Parse segments for source books
   const primarySegments = useMemo(() => {
     if (!sourceLines || sourceLines.length === 0) return [];
-    return parseDocumentSegments(sourceLines.join('\n')).segments;
-  }, [sourceLines]);
+    return parseDocumentSegments(sourceLines.join('\n'), profile).segments;
+  }, [sourceLines, profile]);
 
   const rashiSegments = useMemo(() => {
     if (!rashiLines || rashiLines.length === 0) return [];
-    return parseDocumentSegments(rashiLines.join('\n')).segments;
-  }, [rashiLines]);
+    return parseDocumentSegments(rashiLines.join('\n'), profile).segments;
+  }, [rashiLines, profile]);
 
   const tosafotSegments = useMemo(() => {
     if (!tosafotLines || tosafotLines.length === 0) return [];
-    return parseDocumentSegments(tosafotLines.join('\n')).segments;
-  }, [tosafotLines]);
+    return parseDocumentSegments(tosafotLines.join('\n'), profile).segments;
+  }, [tosafotLines, profile]);
 
   // 3. Current tab segments
   const currentTabSegments = useMemo(() => {
@@ -90,7 +98,8 @@ export const EditLinkModal: React.FC<EditLinkModalProps> = ({
   // 4. Find matching segment index in active tab
   const matchingSegIndex = useMemo(() => {
     if (!commSeg || currentTabSegments.length === 0) return -1;
-    return currentTabSegments.findIndex(s => areHeadersMatching(commSeg.headerTitle, s.headerTitle));
+    const match = findMatchingSegment(currentTabSegments, commSeg.headerTitle);
+    return match ? currentTabSegments.indexOf(match) : -1;
   }, [commSeg, currentTabSegments]);
 
   // 5. Selected segment filter state
