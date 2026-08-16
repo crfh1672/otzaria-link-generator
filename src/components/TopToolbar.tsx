@@ -1,9 +1,10 @@
 import React, { useState } from 'react';
 import { Save, FolderOpen, Download, ArrowLeftRight, RotateCcw, ListTree, Filter, Menu } from 'lucide-react';
 import JSZip from 'jszip';
-import { SessionState } from '../types';
-import { formatLineWithDH, parseDocumentSegments, normalizeText, findMatchingSegment, isLinkableContentLine, findFirstAlignedSegmentIndex } from '../utils/parserAlgorithm';
+import { SessionState, OtzariaLink } from '../types';
+import { formatLineWithDH, parseDocumentSegments, normalizeText, findMatchingSegment, isLinkableContentLine, findFirstAlignedSegmentIndex, HeaderSegment } from '../utils/parserAlgorithm';
 import { profileForConfig } from '../utils/halachaAlgorithm';
+import { mirrorGemaraLine, hasMirrorData } from '../utils/shasMirror';
 import { getWordSimilarity } from '../utils/fuzzyUtils';
 import { calculateDocumentIdfWeights, getCombinedWordWeight } from '../utils/wordWeights';
 import { notifySuccess, notifyError } from '../utils/otzariaBridge';
@@ -45,6 +46,26 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
     try {
       const zip = new JSZip();
 
+      /**
+       * A book title as a file name. Gershayim are dropped rather than replaced, so
+       * `רש"י על ברכות` becomes `רשי על ברכות` instead of `רש_י על ברכות`; the remaining
+       * characters Windows rejects in a name become underscores.
+       */
+      const safeFileName = (name: string) =>
+        name.replace(/"/g, '').replace(/[/\\?%*:|<>]/g, '_').trim();
+
+      const cleanFileName = safeFileName(session.commentaryTitle);
+
+      // The engine's own segmentation of every document, parsed once here because both the
+      // link files below and the unlinked-lines report at the end need it: heRef strings are
+      // `ספר - כותרת הקטע`, so building one costs a segment lookup. parseDocumentSegments is
+      // pure and idempotent on already-parsed session lines.
+      const exportProfile = profileForConfig(session.config);
+      const commDoc = parseDocumentSegments(session.commentaryLines.join('\n'), exportProfile);
+      const srcDoc = parseDocumentSegments(session.sourceLines.join('\n'), exportProfile);
+      const rashiDoc = session.rashiLines ? parseDocumentSegments(session.rashiLines.join('\n'), exportProfile) : null;
+      const tosafotDoc = session.tosafotLines ? parseDocumentSegments(session.tosafotLines.join('\n'), exportProfile) : null;
+
       // 1. Generate _links.json
       const exportedLinks: any[] = [];
       session.links.forEach(link => {
@@ -58,8 +79,111 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
       });
 
       const linksJsonContent = JSON.stringify(exportedLinks, null, 2);
-      const cleanFileName = session.commentaryTitle.replace(/[/\\?%*:|"<>]/g, '_');
       zip.file(`${cleanFileName}_links.json`, linksJsonContent);
+
+      // ── Additional link files ────────────────────────────────────────────────────────────
+      // All of them carry the exact schema of _links.json above — five fields, nothing more —
+      // so anything that already consumes that file consumes these unchanged.
+
+      /** line number -> header title of the segment holding it, for building heRef_2 */
+      const headerTitlesByLine = (segments: HeaderSegment[], lineCount: number): string[] => {
+        const titles = new Array<string>(lineCount + 1).fill('');
+        segments.forEach(segment => {
+          // headerLineIndex is 0 for a document with no headers at all, whose single segment
+          // starts at line 1; the header line itself belongs to its own segment.
+          const from = Math.max(1, segment.headerLineIndex || segment.startLine);
+          for (let line = from; line <= Math.min(segment.endLine, lineCount); line++) {
+            titles[line] = segment.headerTitle;
+          }
+        });
+        return titles;
+      };
+
+      const commentaryHeaders = headerTitlesByLine(commDoc.segments, session.commentaryLines.length);
+      const sourceHeaders = headerTitlesByLine(srcDoc.segments, session.sourceLines.length);
+
+      /** `ספר - כותרת`, the shape parserAlgorithm builds heRef_2 in */
+      const refFor = (bookName: string, headerTitle: string) =>
+        headerTitle ? `${bookName} - ${headerTitle}` : bookName;
+
+      const linkRecord = (lineIndex1: number, lineIndex2: number, heRef2: string, path2: string) => ({
+        line_index_1: lineIndex1,
+        line_index_2: lineIndex2,
+        heRef_2: heRef2,
+        path_2: path2,
+        connection_type: 'commentary'
+      });
+
+      // Reverse files — every link read from the target's side. Once flipped, the commentary
+      // IS the target, so path_2/heRef_2 name it: `<שם הפירוש>.txt` follows the same
+      // `${bookName}.txt` convention the parser uses, and commentaryFileName is built that way.
+      const reverseOf = (link: OtzariaLink) => linkRecord(
+        link.line_index_2,
+        link.line_index_1,
+        refFor(session.commentaryTitle, commentaryHeaders[link.line_index_1] || ''),
+        session.commentaryFileName
+      );
+
+      // A links file is named after the book that owns line_index_1 — which is why the file
+      // built above is named after the commentary. Flipped, line_index_1 belongs to the book
+      // that WAS the target, so each reverse file carries that book's name: ברכות_links.json,
+      // רשי על ברכות_links.json, תוספות על ברכות_links.json. The secondary titles are derived
+      // the same way the parser derives path_2 for a secondary link (`רש"י על <ספר>`).
+      const targetBookName = session.config.targetBookName;
+      const reverseGroups: { bookName: string; links: OtzariaLink[] }[] = [
+        {
+          bookName: targetBookName,
+          links: session.links.filter(l => !l.secondaryTarget)
+        },
+        {
+          bookName: `רש"י על ${targetBookName}`,
+          links: session.links.filter(l => l.secondaryTarget === 'rashi')
+        },
+        {
+          bookName: `תוספות על ${targetBookName}`,
+          links: session.links.filter(l => l.secondaryTarget === 'tosafot')
+        }
+      ];
+
+      reverseGroups.forEach(group => {
+        // A category with no secondary sources at all (הלכה, תנ"ך) would otherwise get empty
+        // files named after books that do not exist.
+        if (group.links.length === 0) return;
+        zip.file(
+          `${safeFileName(group.bookName)}_links.json`,
+          JSON.stringify(group.links.map(reverseOf), null, 2)
+        );
+      });
+
+      // Mirror file — a commentary line that links to רש"י/תוספות also hangs off a line of the
+      // daf itself, and that second link is what this file carries. The engine never computes
+      // it and the editor never shows it: it is Otzaria's own library link, baked into
+      // src/data/shasMirrorTable.ts (see src/utils/shasMirror.ts). For a secondary link
+      // line_index_2 is a line in רש"י/תוספות, which is exactly what the table is keyed by.
+      //
+      // Its line_index_1 is a commentary line, like the main file's, so it cannot be named
+      // after the owning book without colliding — hence the `_גמרא` qualifier.
+      const tractate = targetBookName;
+      if (session.config.sourceCategory === 'shas' && hasMirrorData(tractate)) {
+        const mirrorLinks = session.links.flatMap(link => {
+          const series = link.secondaryTarget;
+          if (series !== 'rashi' && series !== 'tosafot') return [];
+          const gemaraLine = mirrorGemaraLine(tractate, series, link.line_index_2);
+          // Coverage is whatever the library's own links cover — a miss is a line to skip,
+          // not a failure.
+          if (!gemaraLine) return [];
+          return [linkRecord(
+            link.line_index_1,
+            gemaraLine,
+            refFor(tractate, sourceHeaders[gemaraLine] || ''),
+            `${tractate}.txt`
+          )];
+        });
+
+        if (mirrorLinks.length > 0) {
+          zip.file(`${cleanFileName}_גמרא_links.json`, JSON.stringify(mirrorLinks, null, 2));
+        }
+      }
 
       // 2. Generate _links.csv without dhText/confidence/status
       const csvHeaders = ['line_index_1', 'line_index_2', 'heRef_2', 'path_2', 'connection_type'];
@@ -175,14 +299,10 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
       // 4. Generate unlinked lines folder
       const linkedLineIndices = new Set(session.links.map(l => l.line_index_1));
       
-      // אותו פרופיל מקור שהמנוע רץ איתו, כדי שדוח "שורות ללא קישור" יחלק את המסמך לסגמנטים
-      // בדיוק כפי שהמנוע חילק אותו — אחרת שורה ממוספרת שנכתבה כשורת כותרת הייתה נעלמת מהדוח.
-      const exportProfile = profileForConfig(session.config);
-      const commDoc = parseDocumentSegments(session.commentaryLines.join('\n'), exportProfile);
-      const srcDoc = parseDocumentSegments(session.sourceLines.join('\n'), exportProfile);
-      const rashiDoc = session.rashiLines ? parseDocumentSegments(session.rashiLines.join('\n'), exportProfile) : null;
-      const tosafotDoc = session.tosafotLines ? parseDocumentSegments(session.tosafotLines.join('\n'), exportProfile) : null;
-      
+      // exportProfile / commDoc / srcDoc / rashiDoc / tosafotDoc are parsed at the top of this
+      // function. It is the same source profile the engine ran with, so this report splits the
+      // document into exactly the segments the engine did — otherwise a numbered line written
+      // as a header line would vanish from the report.
       const unlinkedFolder = zip.folder("שורות_ללא_קישור");
       
       // Front matter (everything before the first header with a counterpart in the source) is

@@ -26,6 +26,12 @@ Thumbs.db
 # QA fixtures - regenerate with `node qa/extract-books.mjs` (see qa/README.md)
 qa/data/
 
+# Shas commentary link dump (~31MB) - regenerate with
+# `node scripts/extract-shas-commentary-links.mjs`. It is only the INPUT to
+# scripts/generate-shas-mirror.mjs; the generated src/data/shasMirrorTable.ts is committed,
+# so a build does not need this directory.
+data/shas-commentary-links/
+
 # Scratch probes / one-off diagnostics
 src/utils/_*_probe.ts
 qa/*-probe.ts
