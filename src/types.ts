@@ -40,7 +40,7 @@ export interface OtzariaLink {
 }
 
 export interface PluginConfig {
-  sourceCategory: 'tanakh' | 'shas';
+  sourceCategory: 'tanakh' | 'shas' | 'halacha';
   targetBookName: string;
   ignoreShamInShas: boolean;      // "האם המילה 'שם' משמשת כהפניה לדף בגמרא?"
   diburHamatchilDelimiter?: string; // "תו סיום דיבור המתחיל" (e.g. '.' or '.:')
@@ -48,6 +48,14 @@ export interface PluginConfig {
   customAbbreviations?: Record<string, string[]>; // מילון ראשי תיבות מותאם אישית
   useFuzzyMatching?: boolean; // "השוואה גמישה קלה (Fuzzy Matching)"
   useWordWeighting?: boolean; // "שקילת מילים וסינון מילות יחס (Word Weighting)"
+
+  /**
+   * מבנה הקטעים בספרי הלכה. שתי השאלות האלה נשאלות באפיון רק בקטגוריית "הלכה", והן שקובעות
+   * את פרופיל המקור (ראו halachaModeFromConfig ב-src/utils/halachaAlgorithm.ts).
+   * ערך לא מוגדר = כן, כך שסשן שנשמר לפני שהשאלות נוספו נטען עם ההתנהגות שרץ בה.
+   */
+  halachaMultiLinePieces?: boolean; // "קטע פירוש מתחלק לפעמים לכמה שורות"
+  halachaSeifKatan?: boolean;       // "הספר מחולק לסעיפים קטנים"
 }
 
 export interface DHHighlight {
@@ -108,4 +116,15 @@ export const SHAS_TRACTATES = [
   "יבמות", "כתובות", "נדרים", "נזיר", "סוטה", "גיטין", "קידושין",
   "בבא קמא", "בבא מציעא", "בבא בתרא", "סנהדרין", "מכות", "שבועות", "עבודה זרה", "הוריות",
   "זבחים", "מנחות", "חולין", "בכורות", "ערכין", "תמורה", "כריתות", "מעילה", "תמיד", "נדה"
+];
+
+/**
+ * קטגוריית "הלכה" — ארבעת חלקי השולחן ערוך. השמות הם מזהי הספרים שנשלחים ל-fetchBookContent,
+ * ולכן חייבים להתאים לכותרות שאוצריא מחזירה בעץ הספרייה.
+ */
+export const HALACHA_BOOKS = [
+  "שולחן ערוך, אורח חיים",
+  "שולחן ערוך, יורה דעה",
+  "שולחן ערוך, אבן העזר",
+  "שולחן ערוך, חושן משפט"
 ];

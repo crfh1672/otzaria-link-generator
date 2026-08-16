@@ -6,6 +6,7 @@ import {
   isBareSourceLabelLine,
   isHeaderLine
 } from './parserAlgorithm';
+import { SourceProfile, continuesByProfile } from './halachaAlgorithm';
 
 /**
  * Context inheritance ("ירושת הקשר") in the editor.
@@ -40,6 +41,12 @@ import {
 export type ManualInheritLines = ReadonlySet<number> | undefined;
 
 /**
+ * פרופיל המקור של הסשן. נדרש רק לקטגוריות שבהן "המשך" נקבע אחרת מבא"ד — היום קטגוריית הלכה,
+ * שבה כל שורה בלי מספור היא המשך. כשהוא אינו מועבר, הכללים הם כללי ש"ס/תנ"ך בדיוק כשהיו.
+ */
+export type ChainProfile = SourceProfile | undefined;
+
+/**
  * Whether a commentary line opens with an explicit בא"ד/א"ד reference, i.e. states in the text
  * itself that it continues the line above it. The idiom itself is defined once, next to the
  * parser that reads it (`isBaadContinuationLine`), so the two can never drift apart.
@@ -49,15 +56,45 @@ export function hasExplicitBaadMarker(commentaryLine: string): boolean {
 }
 
 /**
- * Whether the line states — in its own text or by the user's hand — that it continues the line
- * above it. The single place the two sources of the same statement are merged.
+ * The content line directly above `lineIdx1` — blank lines and headers skipped, exactly as the
+ * parser skips them. Needed because in a book whose ס"ק marker sits on a line of its own, what
+ * makes a line an opener rather than a continuation is the line above it, not its own text.
+ */
+function prevContentLineOf(
+  commentaryLines: string[],
+  lineIdx1: number,
+  profile?: ChainProfile
+): string | undefined {
+  for (let i = lineIdx1 - 1; i >= 1; i--) {
+    const raw = commentaryLines[i - 1] ?? '';
+    if (!raw.trim()) continue;
+    // A real header (a "סימן" boundary) ends the search: the parser re-initialises its marker
+    // state per segment, so nothing above the header can make this line an opener.
+    if (isHeaderLine(raw, profile)) return undefined;
+    return raw;
+  }
+  return undefined;
+}
+
+/**
+ * Whether the line states — in its own text, by its place in the book's structure, or by the
+ * user's hand — that it continues the line above it. The single place the sources of the same
+ * statement are merged.
+ *
+ * A profile whose pieces are single lines (`allowsInheritance: false`) has no such statement to
+ * make: nothing is a continuation there, and only the user's own hand can declare one.
  */
 export function continuesLineAbove(
   lineIdx1: number,
   rawLine: string,
-  manualInherit?: ManualInheritLines
+  manualInherit?: ManualInheritLines,
+  profile?: ChainProfile,
+  prevContentLine?: string
 ): boolean {
-  return hasExplicitBaadMarker(rawLine) || Boolean(manualInherit?.has(lineIdx1));
+  const declaredByHand = Boolean(manualInherit?.has(lineIdx1));
+  if (profile && !profile.allowsInheritance) return declaredByHand;
+  if (profile && continuesByProfile(profile, rawLine, prevContentLine)) return true;
+  return hasExplicitBaadMarker(rawLine) || declaredByHand;
 }
 
 /**
@@ -68,15 +105,16 @@ export function continuesLineAbove(
 function firstContentLineContinues(
   commentaryLines: string[],
   fromLineIdx1: number,
-  manualInherit?: ManualInheritLines
+  manualInherit?: ManualInheritLines,
+  profile?: ChainProfile
 ): boolean {
-  if (!manualInherit || manualInherit.size === 0) {
+  if (!profile && (!manualInherit || manualInherit.size === 0)) {
     return firstContentLineIsBaad(commentaryLines, fromLineIdx1);
   }
   for (let i = Math.max(1, fromLineIdx1); i <= commentaryLines.length; i++) {
     const raw = commentaryLines[i - 1] ?? '';
-    if (!raw.trim() || isHeaderLine(raw)) continue;
-    return continuesLineAbove(i, raw, manualInherit);
+    if (!raw.trim() || isHeaderLine(raw, profile)) continue;
+    return continuesLineAbove(i, raw, manualInherit, profile, prevContentLineOf(commentaryLines, i, profile));
   }
   return false;
 }
@@ -93,7 +131,8 @@ export function collectInheritedFollowers(
   parentLineIdx1: number,
   links: OtzariaLink[],
   commentaryLines: string[],
-  manualInherit?: ManualInheritLines
+  manualInherit?: ManualInheritLines,
+  profile?: ChainProfile
 ): number[] {
   const followers: number[] = [];
   const linkByLine = new Map(links.map(l => [l.line_index_1, l]));
@@ -102,8 +141,8 @@ export function collectInheritedFollowers(
     const raw = commentaryLines[lineIdx1 - 1] ?? '';
     // A header ends the chain unless the segment it opens starts with a בא"ד line, which
     // continues this chain across it.
-    if (isHeaderLine(raw)) {
-      if (!firstContentLineContinues(commentaryLines, lineIdx1 + 1, manualInherit)) break;
+    if (isHeaderLine(raw, profile)) {
+      if (!firstContentLineContinues(commentaryLines, lineIdx1 + 1, manualInherit, profile)) break;
       continue;
     }
     if (!raw.trim()) continue;
@@ -116,7 +155,7 @@ export function collectInheritedFollowers(
 
     if (link) {
       if (!link.isInherited) break;
-    } else if (!continuesLineAbove(lineIdx1, raw, manualInherit)) {
+    } else if (!continuesLineAbove(lineIdx1, raw, manualInherit, profile, prevContentLineOf(commentaryLines, lineIdx1, profile))) {
       break;
     }
 
@@ -135,7 +174,8 @@ export function findInheritanceParent(
   lineIdx1: number,
   links: OtzariaLink[],
   commentaryLines: string[],
-  manualInherit?: ManualInheritLines
+  manualInherit?: ManualInheritLines,
+  profile?: ChainProfile
 ): number | null {
   const linkByLine = new Map(links.map(l => [l.line_index_1, l]));
 
@@ -144,8 +184,8 @@ export function findInheritanceParent(
     // Symmetrical to collectInheritedFollowers: climbing stops at a header, unless the content
     // line that opens the segment below it says בא"ד — then the chain runs through the header
     // and its head is somewhere in the segment above.
-    if (isHeaderLine(raw)) {
-      if (!firstContentLineContinues(commentaryLines, cursor + 1, manualInherit)) return null;
+    if (isHeaderLine(raw, profile)) {
+      if (!firstContentLineContinues(commentaryLines, cursor + 1, manualInherit, profile)) return null;
       continue;
     }
     if (!raw.trim()) continue;
@@ -163,7 +203,7 @@ export function findInheritanceParent(
     }
     // No link: a בא"ד line is a chain member waiting like this one, anything else is the
     // unresolved head the chain hangs from.
-    if (!continuesLineAbove(cursor, raw, manualInherit)) return cursor;
+    if (!continuesLineAbove(cursor, raw, manualInherit, profile, prevContentLineOf(commentaryLines, cursor, profile))) return cursor;
   }
 
   return null;
@@ -181,12 +221,19 @@ export function findPendingInheritanceHead(
   lineIdx1: number,
   links: OtzariaLink[],
   commentaryLines: string[],
-  manualInherit?: ManualInheritLines
+  manualInherit?: ManualInheritLines,
+  profile?: ChainProfile
 ): number | null {
   if (links.some(l => l.line_index_1 === lineIdx1)) return null;
-  if (!continuesLineAbove(lineIdx1, commentaryLines[lineIdx1 - 1] ?? '', manualInherit)) return null;
+  if (!continuesLineAbove(
+    lineIdx1,
+    commentaryLines[lineIdx1 - 1] ?? '',
+    manualInherit,
+    profile,
+    prevContentLineOf(commentaryLines, lineIdx1, profile)
+  )) return null;
 
-  const head = findInheritanceParent(lineIdx1, links, commentaryLines, manualInherit);
+  const head = findInheritanceParent(lineIdx1, links, commentaryLines, manualInherit, profile);
   if (head === null) return null;
 
   return links.some(l => l.line_index_1 === head) ? null : head;
@@ -211,6 +258,7 @@ export function cascadeInheritedContext(params: {
   tosafotLines?: string[];
   dhHighlights?: Record<number, DHHighlight>;
   manualInherit?: ManualInheritLines;
+  profile?: ChainProfile;
 }): OtzariaLink[] {
   const {
     links,
@@ -220,10 +268,11 @@ export function cascadeInheritedContext(params: {
     rashiLines = [],
     tosafotLines = [],
     dhHighlights = {},
-    manualInherit
+    manualInherit,
+    profile
   } = params;
 
-  const followers = collectInheritedFollowers(parentLineIdx1, links, commentaryLines, manualInherit);
+  const followers = collectInheritedFollowers(parentLineIdx1, links, commentaryLines, manualInherit, profile);
   if (followers.length === 0) return links;
 
   const followerLines = new Set(followers);
@@ -328,7 +377,8 @@ export interface InheritanceIndex {
 export function buildInheritanceIndex(
   links: OtzariaLink[],
   commentaryLines: string[],
-  manualInherit?: ManualInheritLines
+  manualInherit?: ManualInheritLines,
+  profile?: ChainProfile
 ): InheritanceIndex {
   const lineCount = commentaryLines.length;
   const linkByLine = new Map(links.map(l => [l.line_index_1, l]));
@@ -338,25 +388,34 @@ export function buildInheritanceIndex(
   const nextContent = new Array<number>(lineCount + 2).fill(0);
   for (let i = lineCount; i >= 1; i--) {
     const raw = commentaryLines[i - 1] ?? '';
-    nextContent[i] = (!raw.trim() || isHeaderLine(raw)) ? nextContent[i + 1] : i;
+    nextContent[i] = (!raw.trim() || isHeaderLine(raw, profile)) ? nextContent[i + 1] : i;
   }
 
   const roles = new Array<ChainRole>(lineCount + 1);
   /** For a header: whether the chain survives it, i.e. the segment it opens continues the line above. */
   const headerCrossed = new Array<boolean>(lineCount + 1).fill(false);
 
+  // The content line last seen, carried forward so the marker/opener rule (see
+  // `continuesLineAbove`) is answered without a backward scan per line.
+  let prevContent: string | undefined;
+
   for (let i = 1; i <= lineCount; i++) {
     const raw = commentaryLines[i - 1] ?? '';
-    if (isHeaderLine(raw)) {
+    if (isHeaderLine(raw, profile)) {
       roles[i] = 'header';
       const opener = nextContent[i + 1];
-      headerCrossed[i] = opener > 0 && continuesLineAbove(opener, commentaryLines[opener - 1] ?? '', manualInherit);
+      // Marker state does not cross a header — see prevContentLineOf — so the segment's opener
+      // is judged on its own text alone.
+      headerCrossed[i] = opener > 0 && continuesLineAbove(opener, commentaryLines[opener - 1] ?? '', manualInherit, profile);
+      prevContent = undefined;
       continue;
     }
     if (!raw.trim()) {
       roles[i] = 'skip';
       continue;
     }
+    const continues = continuesLineAbove(i, raw, manualInherit, profile, prevContent);
+    prevContent = raw;
     const link = linkByLine.get(i);
     if (!link && isBareSourceLabelLine(raw)) {
       roles[i] = 'skip';
@@ -366,7 +425,7 @@ export function buildInheritanceIndex(
       roles[i] = link.isInherited ? 'member' : 'head';
       continue;
     }
-    roles[i] = continuesLineAbove(i, raw, manualInherit) ? 'member' : 'head';
+    roles[i] = continues ? 'member' : 'head';
   }
 
   // A header is recorded like any other line — the walkers answer for one too, and they read the
@@ -421,13 +480,15 @@ export function markLineAsInherited(params: {
   rashiLines?: string[];
   tosafotLines?: string[];
   dhHighlights?: Record<number, DHHighlight>;
+  profile?: ChainProfile;
 }): { links: OtzariaLink[]; manualInherit: Set<number> } | null {
   const { links, commentaryLines, lineIdx1, manualInherit, ...targets } = params;
+  const profile = params.profile;
 
   const nextManual = new Set(manualInherit ?? []);
   nextManual.add(lineIdx1);
 
-  const head = findInheritanceParent(lineIdx1, links, commentaryLines, nextManual);
+  const head = findInheritanceParent(lineIdx1, links, commentaryLines, nextManual, profile);
   if (head === null) return null;
 
   // The line has to stop owning its target before the cascade runs: the walk down from the head

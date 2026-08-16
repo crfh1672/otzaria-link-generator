@@ -31,6 +31,24 @@ Snapshots live in `qa/snapshots`, or `$QA_SNAP`.
 **Any change to the matching logic must keep `verify` green**, or must be an intentional
 behaviour change re-recorded with `snapshot` and reviewed.
 
+## Unit tests
+
+Self-contained scripts, each one exiting non-zero on the first failure. They run on synthetic
+text written inside the file itself — no fixtures, no network:
+
+```bash
+node --import tsx qa/halacha.test.ts                 # קטגוריית הלכה: מספור, ס"ק, ירושה, מילוי פערים
+node --import tsx qa/inheritance-chain.test.ts       # the editor's chain index vs. the walkers
+node --import tsx qa/manual-inheritance.test.ts      # hand-marked inheritance
+node --import tsx qa/cross-header-inheritance.test.ts
+node --import tsx qa/front-matter.test.ts
+node --import tsx qa/source-keyword-boundary.test.ts
+node --import tsx qa/drag-candidates.test.ts
+node --import tsx qa/export-invariance.test.ts
+```
+
+The halacha category is documented in [docs/HALACHA_CATEGORY.md](../docs/HALACHA_CATEGORY.md).
+
 ## Differential test — `qa/differential.ts`
 
 Runs the optimised helpers and their pre-optimisation originals side by side over real book

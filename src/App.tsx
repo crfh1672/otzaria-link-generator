@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { SessionState, PluginConfig } from './types';
-import { runLinkingParser } from './utils/parserAlgorithm';
+import { runLinkingParser, sanitizeSessionMarkup } from './utils/parserAlgorithm';
 import { TopToolbar } from './components/TopToolbar';
 import { SetupMode } from './components/SetupMode';
 import { EditMode } from './components/EditMode';
@@ -151,7 +151,9 @@ export default function App() {
   };
 
   const handleLoadSession = (loadedSession: SessionState) => {
-    setSession(loadedSession);
+    // A project saved before markup was stripped at ingestion still holds the raw lines, and
+    // would keep showing the tags it was saved with. No-op for anything saved since.
+    setSession(sanitizeSessionMarkup(loadedSession));
     setMode('edit');
     notifySuccess(`פרויקט "${loadedSession.commentaryTitle}" נטען בהצלחה`);
   };

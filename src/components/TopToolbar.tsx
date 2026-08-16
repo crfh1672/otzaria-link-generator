@@ -2,7 +2,8 @@ import React, { useState } from 'react';
 import { Save, FolderOpen, Download, ArrowLeftRight, RotateCcw, ListTree, Filter, Menu } from 'lucide-react';
 import JSZip from 'jszip';
 import { SessionState } from '../types';
-import { formatLineWithDH, parseDocumentSegments, normalizeText, areHeadersMatching, isHeaderLine, findFirstAlignedSegmentIndex } from '../utils/parserAlgorithm';
+import { formatLineWithDH, parseDocumentSegments, normalizeText, findMatchingSegment, isLinkableContentLine, findFirstAlignedSegmentIndex } from '../utils/parserAlgorithm';
+import { profileForConfig } from '../utils/halachaAlgorithm';
 import { getWordSimilarity } from '../utils/fuzzyUtils';
 import { calculateDocumentIdfWeights, getCombinedWordWeight } from '../utils/wordWeights';
 import { notifySuccess, notifyError } from '../utils/otzariaBridge';
@@ -174,10 +175,13 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
       // 4. Generate unlinked lines folder
       const linkedLineIndices = new Set(session.links.map(l => l.line_index_1));
       
-      const commDoc = parseDocumentSegments(session.commentaryLines.join('\n'));
-      const srcDoc = parseDocumentSegments(session.sourceLines.join('\n'));
-      const rashiDoc = session.rashiLines ? parseDocumentSegments(session.rashiLines.join('\n')) : null;
-      const tosafotDoc = session.tosafotLines ? parseDocumentSegments(session.tosafotLines.join('\n')) : null;
+      // אותו פרופיל מקור שהמנוע רץ איתו, כדי שדוח "שורות ללא קישור" יחלק את המסמך לסגמנטים
+      // בדיוק כפי שהמנוע חילק אותו — אחרת שורה ממוספרת שנכתבה כשורת כותרת הייתה נעלמת מהדוח.
+      const exportProfile = profileForConfig(session.config);
+      const commDoc = parseDocumentSegments(session.commentaryLines.join('\n'), exportProfile);
+      const srcDoc = parseDocumentSegments(session.sourceLines.join('\n'), exportProfile);
+      const rashiDoc = session.rashiLines ? parseDocumentSegments(session.rashiLines.join('\n'), exportProfile) : null;
+      const tosafotDoc = session.tosafotLines ? parseDocumentSegments(session.tosafotLines.join('\n'), exportProfile) : null;
       
       const unlinkedFolder = zip.folder("שורות_ללא_קישור");
       
@@ -192,14 +196,16 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
       if (unlinkedFolder) {
         commDoc.segments.forEach((commSeg, segIdx) => {
           if (firstAlignedSegIdx > 0 && segIdx < firstAlignedSegIdx) return;
-          const srcSeg = srcDoc.segments.find(s => areHeadersMatching(commSeg.headerTitle, s.headerTitle));
-          const rashiSeg = rashiDoc ? rashiDoc.segments.find(s => areHeadersMatching(commSeg.headerTitle, s.headerTitle)) : null;
-          const tosafotSeg = tosafotDoc ? tosafotDoc.segments.find(s => areHeadersMatching(commSeg.headerTitle, s.headerTitle)) : null;
+          const srcSeg = findMatchingSegment(srcDoc.segments, commSeg.headerTitle);
+          const rashiSeg = rashiDoc ? findMatchingSegment(rashiDoc.segments, commSeg.headerTitle) : null;
+          const tosafotSeg = tosafotDoc ? findMatchingSegment(tosafotDoc.segments, commSeg.headerTitle) : null;
           
           for (let i = commSeg.startLine; i <= commSeg.endLine; i++) {
             if (i > session.commentaryLines.length) break;
             const line = session.commentaryLines[i - 1];
-            if (!line || !line.trim() || isHeaderLine(line)) continue;
+            // אותו מבחן שהמנוע עצמו עושה לפני שהוא מחליט קישור / אין קישור, כדי ששורה מבנית
+            // — כותרת, או שורת אסימון ס"ק שאין בה טקסט — לא תדווח כשורה שנכשלה.
+            if (!isLinkableContentLine(line, exportProfile)) continue;
             
             if (!linkedLineIndices.has(i)) {
               let content = `שורה מפרש ללא קישור (שורה ${i}):\n${line}\n\n`;

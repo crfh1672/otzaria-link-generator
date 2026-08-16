@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } from 'react';
 import { SessionState, OtzariaLink } from '../types';
-import { formatLineWithDH, parseDocumentSegments, findLinkingStartLine } from '../utils/parserAlgorithm';
+import { formatLineWithDH, parseDocumentSegments, findLinkingStartLine, isLinkableContentLine } from '../utils/parserAlgorithm';
+import { profileForConfig } from '../utils/halachaAlgorithm';
 import { EditLinkModal } from './EditLinkModal';
 import {
   Edit3,
@@ -468,7 +469,8 @@ export const EditMode: React.FC<EditModeProps> = ({
       rashiLines: session.rashiLines,
       tosafotLines: session.tosafotLines,
       dhHighlights: session.dhHighlights,
-      manualInherit: manualInheritSet
+      manualInherit: manualInheritSet,
+      profile: profileForConfig(session.config)
     });
 
     onUpdateSession({
@@ -489,6 +491,16 @@ export const EditMode: React.FC<EditModeProps> = ({
   } = session;
 
   /**
+   * פרופיל המקור של הסשן, כפי שהמנוע בחר אותו. שרשראות הירושה בעורך משחזרות את כללי המנוע,
+   * ובקטגוריית הלכה הכללים האלה נגזרים מהמספור ולא מבא"ד — בלעדיו העורך היה מציג שורת המשך
+   * לא ממוספרת שאין לה קישור כראש שרשרת עצמאי במקום כשורה שממתינה לקטע שמעליה.
+   */
+  const chainProfile = useMemo(
+    () => profileForConfig(config),
+    [config.sourceCategory, config.halachaMultiLinePieces, config.halachaSeifKatan]
+  );
+
+  /**
    * Every line's place in its inheritance chain, for the whole document at once.
    *
    * Each row shows what it inherits from and what follows it, and asking the per-line walkers
@@ -496,8 +508,8 @@ export const EditMode: React.FC<EditModeProps> = ({
    * render, including the ones a selection click causes.
    */
   const inheritanceIndex = useMemo(
-    () => buildInheritanceIndex(links, commentaryLines, manualInheritSet),
-    [links, commentaryLines, manualInheritSet]
+    () => buildInheritanceIndex(links, commentaryLines, manualInheritSet, chainProfile),
+    [links, commentaryLines, manualInheritSet, chainProfile]
   );
 
   /**
@@ -567,8 +579,8 @@ export const EditMode: React.FC<EditModeProps> = ({
    * failed to find a source: they are shown plainly, with no warning and no unlinked count.
    */
   const linkingStartLine = useMemo(
-    () => findLinkingStartLine(commentaryLines, sourceLines, rashiLines, tosafotLines),
-    [commentaryLines, sourceLines, rashiLines, tosafotLines]
+    () => findLinkingStartLine(commentaryLines, sourceLines, rashiLines, tosafotLines, chainProfile),
+    [commentaryLines, sourceLines, rashiLines, tosafotLines, chainProfile]
   );
   const isFrontMatterLine = useCallback(
     (lineIdx1: number) => lineIdx1 < linkingStartLine,
@@ -598,9 +610,9 @@ export const EditMode: React.FC<EditModeProps> = ({
     const unlinked: { lineIndex1: number; text: string }[] = [];
     commentaryLines.forEach((line, idx) => {
       const lineIdx1 = idx + 1; // 1-based
-      if (!line.trim() || /<h[1-6][^>]*>.*<\/h[1-6]>/i.test(line) || /^#{1,6}\s+/.test(line)) {
-        return;
-      }
+      // אותו מבחן שהמנוע עושה לפני שהוא מחליט קישור / אין קישור: כותרת, ושורת אסימון ס"ק
+      // שכל תוכנה המספור, אינן שורות שנכשלו — אין בהן מה לחפש מלכתחילה.
+      if (!isLinkableContentLine(line, chainProfile)) return;
       // Front matter is not "still to be linked" — there is nothing for it to link to.
       if (isFrontMatterLine(lineIdx1)) return;
       if (!linkedCommLineIndices.has(lineIdx1) && pendingInheritanceHeads[lineIdx1] === undefined) {
@@ -608,11 +620,13 @@ export const EditMode: React.FC<EditModeProps> = ({
       }
     });
     return unlinked;
-  }, [commentaryLines, linkedCommLineIndices, pendingInheritanceHeads, isFrontMatterLine]);
+  }, [commentaryLines, linkedCommLineIndices, pendingInheritanceHeads, isFrontMatterLine, chainProfile]);
 
   const commentarySegments = useMemo(() => {
-    return parseDocumentSegments(commentaryLines.join('\n')).segments;
-  }, [commentaryLines]);
+    // עם הפרופיל, בדיוק כמו המנוע: בספרי הלכה שורת ס"ק שנכתבה ככותרת אינה גבול-סגמנט, ובלעדיו
+    // מגירת הניווט הייתה מציגה כל ס"ק כ"סימן" נפרד עם טווחי שורות שאינם טווחי המנוע.
+    return parseDocumentSegments(commentaryLines.join('\n'), chainProfile).segments;
+  }, [commentaryLines, chainProfile]);
 
   const filteredDrawerSegments = useMemo(() => {
     if (!drawerSearchQuery.trim()) return commentarySegments;
@@ -660,10 +674,13 @@ export const EditMode: React.FC<EditModeProps> = ({
 
     commentaryLines.forEach((line, idx) => {
       const commLineIdx1 = idx + 1;
-      if (!line.trim() || /<h[1-6][^>]*>.*<\/h[1-6]>/i.test(line) || /^#{1,6}\s+/.test(line)) {
+      // אותו מבחן שהמנוע עושה: שורה שאינה משתתפת בקישור אינה מוצגת כשורה לעריכה. בקטגוריות
+      // ש"ס/תנ"ך זה בדיוק כמו קודם (ריקה או כותרת), ובספרי הלכה גם שורת אסימון ס"ק — בעוד
+      // שס"ק שנכתב ככותרת ונושא טקסט הוא שורת תוכן לכל דבר, ונשאר ברשימה במקום להיעלם ממנה.
+      if (!isLinkableContentLine(line, chainProfile)) {
         return;
       }
-      
+
       const link = links.find(l => l.line_index_1 === commLineIdx1);
 
       if (q) {
@@ -697,7 +714,7 @@ export const EditMode: React.FC<EditModeProps> = ({
     }
 
     return indices;
-  }, [commentaryLines, links, sourceSearchQuery, sortMode, sourceLines, rashiLines, tosafotLines]);
+  }, [commentaryLines, links, sourceSearchQuery, sortMode, sourceLines, rashiLines, tosafotLines, chainProfile]);
 
   const groupedCommentary = useMemo(() => {
     const groups: {
@@ -838,7 +855,8 @@ export const EditMode: React.FC<EditModeProps> = ({
       rashiLines,
       tosafotLines,
       dhHighlights,
-      manualInherit: manualInheritSet
+      manualInherit: manualInheritSet,
+      profile: chainProfile
     });
   };
 
@@ -905,7 +923,8 @@ export const EditMode: React.FC<EditModeProps> = ({
         sourceLines,
         rashiLines,
         tosafotLines,
-        dhHighlights
+        dhHighlights,
+        profile: chainProfile
       });
       // null means there is nothing above this line to continue — it is left as it was.
       if (next) {
@@ -1587,6 +1606,7 @@ export const EditMode: React.FC<EditModeProps> = ({
           tosafotLines={tosafotLines}
           targetBookName={config.targetBookName}
           isShas={config.sourceCategory === 'shas'}
+          profile={chainProfile}
           bulkLineCount={actionTargets(editingCommLineIdx).length}
           onSave={handleSaveLink}
           onClose={() => setEditingCommLineIdx(null)}
